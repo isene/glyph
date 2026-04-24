@@ -14,7 +14,7 @@ stdout. Handles composite glyphs, UTF-8 input, and OpenType variable
 fonts (fvar + gvar + IUP) — so glyph renders your real kitty font at
 any weight from 100 (Thin) to 700 (Bold), interpolated correctly.
 
-Part of the **CHasm** (CHange to ASM) suite:
+Part of the **[CHasm](https://github.com/isene/chasm)** (CHange to ASM) suite:
 [bare](https://github.com/isene/bare) (shell),
 [glass](https://github.com/isene/glass) (terminal),
 [show](https://github.com/isene/show) (file viewer),
@@ -199,7 +199,7 @@ renders weirdly please open an issue with the font and codepoint.
 - [ ] Color emoji (CBDT / sbix tables)
 - [ ] GSUB ligatures
 
-## The CHasm Suite
+## The [CHasm](https://github.com/isene/chasm) Suite
 
 | Tool | Purpose | Binary | Lines |
 |------|---------|--------|-------|
@@ -210,6 +210,9 @@ renders weirdly please open an issue with the font and codepoint.
 | glyph | Font rasterizer | ~37KB | ~4.2K |
 
 All five: pure x86_64 assembly, no libc, no dependencies, direct syscalls.
+See the [CHasm group repo](https://github.com/isene/chasm) for the
+full philosophy and the screenshot of the entire desktop running on
+~400KB of executable code.
 
 ## License
 
