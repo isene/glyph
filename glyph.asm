@@ -26,8 +26,9 @@
 ; ---------------------------------------------------------------------
 section .data
 
-usage_msg:      db "usage: glyph FONT.ttf CODEPOINT SIZE", 10
-                db "       glyph FONT.ttf STRING SIZE", 10
+usage_msg:      db "usage: glyph FONT.ttf CODEPOINT SIZE [WEIGHT]", 10
+                db "       glyph FONT.ttf STRING SIZE [WEIGHT]", 10
+                db "       (WEIGHT only meaningful for variable fonts; default = fvar default, e.g. 400)", 10
 usage_len       equ $ - usage_msg
 
 err_open:       db "glyph: open failed", 10
@@ -129,6 +130,12 @@ tag_hmtx:       db "hmtx"
 tag_cmap:       db "cmap"
 tag_loca:       db "loca"
 tag_glyf:       db "glyf"
+; optional (variable fonts only)
+tag_fvar:       db "fvar"
+tag_gvar:       db "gvar"
+tag_avar:       db "avar"
+; variation axis tags
+tag_wght:       db "wght"
 
 ; ---------------------------------------------------------------------
 section .bss
@@ -160,6 +167,31 @@ tbl_loca_off:   resq 1
 tbl_loca_len:   resq 1
 tbl_glyf_off:   resq 1
 tbl_glyf_len:   resq 1
+tbl_fvar_off:   resq 1
+tbl_fvar_len:   resq 1
+tbl_gvar_off:   resq 1
+tbl_gvar_len:   resq 1
+tbl_avar_off:   resq 1
+tbl_avar_len:   resq 1
+
+; ---- variable-font state (zero unless fvar present) ----
+fvar_axis_count:        resq 1
+fvar_wght_default:      resq 1          ; in user units (e.g. 400)
+fvar_wght_min:          resq 1
+fvar_wght_max:          resq 1
+arg_weight:             resq 1          ; user-requested weight (0 = default)
+norm_coord_q:           resq 1          ; normalized weight in F2DOT14 (-16384..+16384)
+
+; ---- gvar parsed state ----
+gvar_axis_count:        resq 1
+gvar_shared_count:      resq 1
+gvar_shared_ptr:        resq 1          ; absolute pointer to shared tuples
+gvar_glyph_count:       resq 1
+gvar_flags:             resq 1
+gvar_data_array_ptr:    resq 1          ; absolute pointer to data array
+gvar_offsets_ptr:       resq 1          ; absolute pointer to offset array
+
+; (gvar transient state moved below MAX_POINTS definition.)
 
 ; small scratch buffers
 hex_buf:        resb 32
@@ -224,6 +256,26 @@ pt_x:                   resd MAX_POINTS         ; signed font units
 pt_y:                   resd MAX_POINTS
 pt_flags:               resb MAX_POINTS         ; original TTF flag byte (need only ON_CURVE bit)
 
+; ---- gvar transient state (single-glyph pass) ----
+%define MAX_GVAR_PTS    (MAX_POINTS + 4)        ; outline + 4 phantom points
+_gv_walk:               resq 1
+_gv_data_end:           resq 1
+_gv_data_block:         resq 1
+_gv_npts_glyph:         resq 1
+_gv_shared_n:           resq 1
+_gv_shared_all:         resq 1
+_gv_shared:             resw MAX_GVAR_PTS
+_gv_pts_n:              resq 1
+_gv_pts:                resw MAX_GVAR_PTS
+_gv_x_deltas:           resw MAX_GVAR_PTS
+_gv_y_deltas:           resw MAX_GVAR_PTS
+_gv_peak:               resw 4
+_gv_int_start:          resw 4
+_gv_int_end:            resw 4
+_gv_have_intermediate:  resq 1
+_gv_scalar_q:           resq 1
+_gv_size_tmp:           resq 1
+
 ; ---- rasterizer state ----
 %define SS              4                       ; supersample factor
 %define MAX_OUT_DIM     512                     ; max output W or H
@@ -267,7 +319,19 @@ _start:
         mov     rbp, rsp                ; for argv access
         mov     rax, [rbp]              ; argc
         cmp     rax, 4
-        jne     .usage
+        jl      .usage
+        cmp     rax, 5
+        jg      .usage
+        ; If 5 args, the 5th is the weight (variable fonts).
+        cmp     rax, 5
+        jne     .no_weight
+        mov     rdi, [rbp + 40]
+        call    parse_decimal
+        mov     [arg_weight], rax
+        jmp     .have_weight
+.no_weight:
+        mov     qword [arg_weight], 0   ; 0 = use fvar default (or N/A)
+.have_weight:
 
         mov     rdi, [rbp + 16]         ; argv[1] = font path
         mov     [arg_font_path], rdi
@@ -355,6 +419,9 @@ _start:
         call    parse_head
         call    parse_maxp
         call    parse_hhea
+        call    parse_fvar              ; no-op if fvar absent
+        call    compute_norm_coord      ; based on arg_weight + fvar
+        call    parse_gvar              ; no-op if gvar absent
 
         ; --- locate cmap format-4 subtable ---
         call    find_cmap_format4
@@ -382,6 +449,16 @@ _start:
         call    parse_glyf
         cmp     eax, 2
         je      .err_too_many
+
+        ; Apply gvar deltas if outer glyph is simple (composites: TODO)
+        mov     rdi, [glyf_off]
+        call    be_i16
+        test    rax, rax
+        js      .skip_single_gvar
+        mov     rdi, [glyph_id]
+        xor     rsi, rsi                  ; start_pts = 0 (single mode)
+        call    apply_gvar_to_simple
+.skip_single_gvar:
 
         call    compute_metrics
         cmp     qword [img_W], MAX_OUT_DIM
@@ -486,6 +563,24 @@ _start:
         pop     rbx
         cmp     eax, 2
         je      .err_too_many
+
+        ; gvar for simple outer glyph
+        mov     rdi, [glyf_off]
+        push    rbx
+        call    be_i16
+        pop     rbx
+        test    rax, rax
+        js      .s_no_gvar
+        movsxd  rax, dword [str_glyph_ids + rbx*4]
+        mov     rdi, rax
+        push    rbx
+        ; start_pts = 0 (we cleared out_numPoints above for each char)
+        ; Actually we DON'T reset out_numPoints between chars in str mode —
+        ; we re-enter parse_glyf which DOES reset. So start_pts is always 0.
+        xor     rsi, rsi
+        call    apply_gvar_to_simple
+        pop     rbx
+.s_no_gvar:
 
         ; transform with this glyph's pen_x_fix and the shared baseline.
         movsxd  rax, dword [str_pen_x_fix + rbx*4]
@@ -657,8 +752,20 @@ parse_sfnt:
         lea     rdi, [tbl_loca_off]
         jmp     .store
 .t6:    cmp     eax, [tag_glyf]
-        jne     .next
+        jne     .t7
         lea     rdi, [tbl_glyf_off]
+        jmp     .store
+.t7:    cmp     eax, [tag_fvar]
+        jne     .t8
+        lea     rdi, [tbl_fvar_off]
+        jmp     .store
+.t8:    cmp     eax, [tag_gvar]
+        jne     .t9
+        lea     rdi, [tbl_gvar_off]
+        jmp     .store
+.t9:    cmp     eax, [tag_avar]
+        jne     .next
+        lea     rdi, [tbl_avar_off]
 
 .store:
         mov     eax, [r14 + 8]
@@ -923,6 +1030,815 @@ parse_hhea:
         call    be_u16
         mov     [hhea_numLongMetrics], rax
         add     rsp, 8
+        ret
+
+; ---------------------------------------------------------------------
+; parse_fvar — populates fvar_axis_count + the wght-axis defaults if
+; an fvar table is present. No-op for static fonts.
+;
+; fvar layout:
+;   u16 majorVersion, minorVersion
+;   u16 axesArrayOffset      (from start of fvar)
+;   u16 reserved
+;   u16 axisCount, axisSize
+;   u16 instanceCount, instanceSize
+;
+; Each variation axis record (axisSize bytes, normally 20):
+;   u32 axisTag (4 ASCII)
+;   Fixed (i32) minValue, defaultValue, maxValue   (16.16)
+;   u16 flags, axisNameID
+parse_fvar:
+        mov     qword [fvar_axis_count], 0
+        mov     qword [fvar_wght_default], 400
+        mov     qword [fvar_wght_min], 100
+        mov     qword [fvar_wght_max], 900
+
+        cmp     qword [tbl_fvar_off], 0
+        je      .ret
+
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+
+        mov     r12, [font_base]
+        add     r12, [tbl_fvar_off]
+
+        ; axisCount at offset 8
+        lea     rdi, [r12 + 8]
+        call    be_u16
+        mov     [fvar_axis_count], rax
+        mov     r13, rax                 ; nax
+
+        ; axisSize at offset 10 (typically 20)
+        lea     rdi, [r12 + 10]
+        call    be_u16
+        mov     r14, rax                 ; axsz
+
+        ; axesArrayOffset at offset 4
+        lea     rdi, [r12 + 4]
+        call    be_u16
+        lea     rbx, [r12 + rax]         ; rbx -> first axis record
+
+.l:
+        test    r13, r13
+        jz      .done
+        ; tag
+        mov     eax, [rbx]               ; raw bytes (disk order)
+        cmp     eax, [tag_wght]
+        jne     .next
+        ; defaultValue at offset 8 (Fixed = 16.16; integer part is the
+        ; weight). Take only the integer part.
+        lea     rdi, [rbx + 4]
+        call    be_u32
+        sar     eax, 16
+        mov     [fvar_wght_min], rax
+        lea     rdi, [rbx + 8]
+        call    be_u32
+        sar     eax, 16
+        mov     [fvar_wght_default], rax
+        lea     rdi, [rbx + 12]
+        call    be_u32
+        sar     eax, 16
+        mov     [fvar_wght_max], rax
+        jmp     .done
+.next:
+        add     rbx, r14
+        dec     r13
+        jmp     .l
+.done:
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+.ret:
+        ret
+
+; ---------------------------------------------------------------------
+; compute_norm_coord — derives normalized coord (F2DOT14) from
+; arg_weight + fvar defaults. Stored at [norm_coord_q].
+;
+;   wght <= default : norm = (wght - default) / (default - min)  -> [-1..0]
+;   wght >  default : norm = (wght - default) / (max - default)  -> (0..+1]
+;
+; F2DOT14: ±1.0 = ±16384.
+compute_norm_coord:
+        mov     qword [norm_coord_q], 0
+
+        ; If arg_weight == 0, treat as default → norm=0.
+        mov     rax, [arg_weight]
+        test    rax, rax
+        jz      .ret
+
+        mov     rcx, [fvar_wght_default]
+        cmp     rax, rcx
+        je      .ret                      ; exactly default → 0
+        jl      .below
+
+        ; above default: (wght - default) * 16384 / (max - default)
+        sub     rax, rcx
+        shl     rax, 14
+        mov     rcx, [fvar_wght_max]
+        sub     rcx, [fvar_wght_default]
+        test    rcx, rcx
+        jz      .ret
+        cqo
+        idiv    rcx
+        mov     [norm_coord_q], rax
+        jmp     .ret
+
+.below:
+        sub     rax, rcx                  ; negative
+        shl     rax, 14
+        mov     rcx, [fvar_wght_default]
+        sub     rcx, [fvar_wght_min]
+        test    rcx, rcx
+        jz      .ret
+        cqo
+        idiv    rcx
+        mov     [norm_coord_q], rax
+.ret:
+        ret
+
+; ---------------------------------------------------------------------
+; parse_gvar — locate gvar arrays. No-op if no gvar.
+;
+; gvar header (20 bytes):
+;   u16 majorVersion (1)
+;   u16 minorVersion (0)
+;   u16 axisCount
+;   u16 sharedTupleCount
+;   u32 sharedTuplesOffset            (from gvar start)
+;   u16 glyphCount
+;   u16 flags                          (bit 0: 0=u16 offsets/2, 1=u32 byte offsets)
+;   u32 glyphVariationDataArrayOffset (from gvar start)
+;   then offsets[glyphCount + 1]
+parse_gvar:
+        mov     qword [gvar_glyph_count], 0
+        cmp     qword [tbl_gvar_off], 0
+        je      .ret
+        push    rbx
+        push    r12
+        mov     r12, [font_base]
+        add     r12, [tbl_gvar_off]
+
+        lea     rdi, [r12 + 4]
+        call    be_u16
+        mov     [gvar_axis_count], rax
+
+        lea     rdi, [r12 + 6]
+        call    be_u16
+        mov     [gvar_shared_count], rax
+
+        lea     rdi, [r12 + 8]
+        call    be_u32
+        lea     rbx, [r12 + rax]
+        mov     [gvar_shared_ptr], rbx
+
+        lea     rdi, [r12 + 12]
+        call    be_u16
+        mov     [gvar_glyph_count], rax
+
+        lea     rdi, [r12 + 14]
+        call    be_u16
+        mov     [gvar_flags], rax
+
+        lea     rdi, [r12 + 16]
+        call    be_u32
+        lea     rbx, [r12 + rax]
+        mov     [gvar_data_array_ptr], rbx
+
+        ; offset array starts right after the header (20 bytes in)
+        lea     rbx, [r12 + 20]
+        mov     [gvar_offsets_ptr], rbx
+
+        pop     r12
+        pop     rbx
+.ret:
+        ret
+
+; ---------------------------------------------------------------------
+; gvar_lookup — rdi = glyph_id. Returns rax = absolute ptr to this
+; glyph's variation data; rdx = byte length (0 = no variation data).
+gvar_lookup:
+        push    rbx
+        cmp     qword [gvar_glyph_count], 0
+        je      .none
+        cmp     rdi, [gvar_glyph_count]
+        jge     .none
+
+        mov     rbx, rdi
+        mov     rax, [gvar_flags]
+        test    rax, 1
+        jnz     .long_fmt
+
+        ; short: u16 entries, multiply by 2 for byte offset
+        mov     rdi, [gvar_offsets_ptr]
+        lea     rdi, [rdi + rbx*2]
+        call    be_u16
+        shl     rax, 1
+        mov     rdx, rax
+        mov     rdi, [gvar_offsets_ptr]
+        lea     rdi, [rdi + rbx*2 + 2]
+        call    be_u16
+        shl     rax, 1
+        sub     rax, rdx                 ; length
+        mov     rdx, rax
+        mov     rax, [gvar_data_array_ptr]
+        ; need to add the start offset; recompute
+        push    rdx
+        mov     rdi, [gvar_offsets_ptr]
+        lea     rdi, [rdi + rbx*2]
+        call    be_u16
+        shl     rax, 1
+        pop     rdx
+        add     rax, [gvar_data_array_ptr]
+        jmp     .ret_check
+.long_fmt:
+        mov     rdi, [gvar_offsets_ptr]
+        lea     rdi, [rdi + rbx*4]
+        call    be_u32
+        push    rax                      ; start_off
+        mov     rdi, [gvar_offsets_ptr]
+        lea     rdi, [rdi + rbx*4 + 4]
+        call    be_u32
+        pop     rdx                      ; reuse stack pop into rdx
+        ; rdx = start_off, rax = end_off
+        mov     rcx, rax
+        sub     rcx, rdx
+        mov     rsi, rcx                 ; length
+        mov     rax, rdx
+        add     rax, [gvar_data_array_ptr]
+        mov     rdx, rsi
+        jmp     .ret_check
+.none:
+        xor     eax, eax
+        xor     edx, edx
+.ret:
+        pop     rbx
+        ret
+.ret_check:
+        test    rdx, rdx
+        jnz     .ret
+        xor     eax, eax
+        jmp     .ret
+
+; ---------------------------------------------------------------------
+; gv_decode_count — read packed count.
+;   in : rdi = ptr
+;   out: rax = count, rdi = advanced
+; encoding:
+;   byte == 0     -> caller treats as "all points" sentinel
+;   byte <  0x80  -> count = byte
+;   byte >= 0x80  -> count = ((byte & 0x7F) << 8) | next_byte
+gv_decode_count:
+        movzx   eax, byte [rdi]
+        inc     rdi
+        test    al, 0x80
+        jz      .small
+        and     eax, 0x7F
+        shl     eax, 8
+        movzx   ecx, byte [rdi]
+        or      eax, ecx
+        inc     rdi
+.small:
+        ret
+
+; ---------------------------------------------------------------------
+; gv_decode_points — decode packed point numbers into _gv_pts (and
+; sets _gv_pts_n). If the leading count byte is 0, all glyph points
+; are referenced; we fill _gv_pts with 0..npts-1 and set _gv_shared_all
+; (caller may opt for the "all" sentinel by inspecting _gv_pts_n).
+;
+;   in : rdi = ptr to packed data
+;   out: rdi advanced past consumed bytes
+gv_decode_points:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+
+        movzx   eax, byte [rdi]
+        test    al, al
+        jnz     .real
+        ; "all points": fill _gv_pts with 0..npts_glyph-1
+        inc     rdi
+        mov     rcx, [_gv_npts_glyph]
+        mov     [_gv_pts_n], rcx
+        xor     rbx, rbx
+.fa:
+        cmp     rbx, rcx
+        jge     .fa_done
+        mov     [_gv_pts + rbx*2], bx
+        inc     rbx
+        jmp     .fa
+.fa_done:
+        jmp     .ret
+
+.real:
+        call    gv_decode_count          ; rax = total count, rdi = advanced
+        mov     [_gv_pts_n], rax
+        mov     r14, rax                 ; total
+
+        xor     r12, r12                 ; running point number
+        xor     r13, r13                 ; emitted index
+.runs:
+        cmp     r13, r14
+        jge     .ret
+        movzx   eax, byte [rdi]
+        inc     rdi
+        mov     ebx, eax
+        and     ebx, 0x7F
+        inc     ebx                      ; run length 1..128
+        test    al, 0x80
+        jz      .u8_run
+
+        ; u16 deltas
+.u16_loop:
+        test    ebx, ebx
+        jz      .runs
+        cmp     r13, r14
+        jge     .ret
+        movzx   eax, byte [rdi]
+        shl     eax, 8
+        movzx   ecx, byte [rdi + 1]
+        or      eax, ecx
+        add     rdi, 2
+        add     r12, rax
+        mov     [_gv_pts + r13*2], r12w
+        inc     r13
+        dec     ebx
+        jmp     .u16_loop
+
+.u8_run:
+.u8_loop:
+        test    ebx, ebx
+        jz      .runs
+        cmp     r13, r14
+        jge     .ret
+        movzx   eax, byte [rdi]
+        inc     rdi
+        add     r12, rax
+        mov     [_gv_pts + r13*2], r12w
+        inc     r13
+        dec     ebx
+        jmp     .u8_loop
+
+.ret:
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; gv_decode_deltas — decode N packed deltas (each i16 logically) into
+; the buffer at rsi (each entry a word). N comes from _gv_pts_n.
+;   in : rdi = ptr, rsi = output i16 buffer
+;   out: rdi advanced
+gv_decode_deltas:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+
+        mov     r12, rsi                 ; output ptr
+        mov     r13, [_gv_pts_n]         ; total
+        xor     r14, r14                 ; emitted
+
+.runs:
+        cmp     r14, r13
+        jge     .ret
+        movzx   eax, byte [rdi]
+        inc     rdi
+        mov     ebx, eax
+        and     ebx, 0x3F
+        inc     ebx                      ; run length 1..64
+        mov     ecx, eax
+        and     ecx, 0xC0                ; control bits
+        cmp     ecx, 0x80
+        je      .word_run
+        cmp     ecx, 0x40                ; bit 6 set, bit 7 clear → zero deltas
+        je      .zero_run
+        ; default 0x00 → byte deltas
+.byte_run:
+        test    ebx, ebx
+        jz      .runs
+        cmp     r14, r13
+        jge     .ret
+        movsx   eax, byte [rdi]
+        inc     rdi
+        mov     [r12 + r14*2], ax
+        inc     r14
+        dec     ebx
+        jmp     .byte_run
+.word_run:
+        test    ebx, ebx
+        jz      .runs
+        cmp     r14, r13
+        jge     .ret
+        movzx   eax, byte [rdi]
+        shl     eax, 8
+        movzx   ecx, byte [rdi + 1]
+        or      eax, ecx
+        movsx   eax, ax
+        add     rdi, 2
+        mov     [r12 + r14*2], ax
+        inc     r14
+        dec     ebx
+        jmp     .word_run
+.zero_run:
+        test    ebx, ebx
+        jz      .runs
+        cmp     r14, r13
+        jge     .ret
+        mov     word [r12 + r14*2], 0
+        inc     r14
+        dec     ebx
+        jmp     .zero_run
+
+.ret:
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; gv_compute_scalar — single-axis tuple-variation scalar at the user's
+; normalized coord. Implements the OpenType spec literally:
+;
+;   peak == 0       -> ignore axis (scalar contribution = 1)
+;   norm == 0       -> scalar = 0  (we're at the default)
+;   norm == peak    -> scalar = 1
+;   sign(norm) != sign(peak) -> scalar = 0
+;   default region (no explicit intermediate):
+;       intStart = 0
+;       intEnd   = +/-1 (same sign as peak)   in F2DOT14: ±16384
+;   then in either case (default or explicit intermediate):
+;       norm in [intStart, peak]: scalar = (norm - intStart) / (peak - intStart)
+;       norm in [peak, intEnd]:   scalar = (intEnd - norm)  / (intEnd - peak)
+;       else:                     scalar = 0
+;
+; All values F2DOT14. Output: [_gv_scalar_q].
+gv_compute_scalar:
+        push    rbx
+        push    r12
+        movsx   rbx, word [_gv_peak]
+        mov     rcx, [norm_coord_q]
+
+        test    rbx, rbx
+        jnz     .have_peak
+        mov     qword [_gv_scalar_q], 16384
+        jmp     .ret
+.have_peak:
+        test    rcx, rcx
+        jz      .zero
+        cmp     rcx, rbx
+        je      .one
+
+        ; sign(rcx) XOR sign(rbx); if differ, opposite -> 0
+        mov     rax, rcx
+        xor     rax, rbx
+        js      .zero
+
+        ; resolve intermediate bounds
+        cmp     qword [_gv_have_intermediate], 0
+        jne     .explicit_int
+        ; default region: intStart = 0, intEnd = sign(peak) * 16384
+        xor     rdx, rdx                  ; intStart
+        mov     r12, 16384                ; intEnd magnitude
+        test    rbx, rbx
+        jns     .ie_set
+        neg     r12                       ; intEnd = -16384 if peak negative
+.ie_set:
+        jmp     .ranges
+.explicit_int:
+        movsx   rdx, word [_gv_int_start]
+        movsx   r12, word [_gv_int_end]
+
+.ranges:
+        ; in [intStart, peak] ? -> rising side
+        ; (use signed compare; we know peak and norm same sign)
+        ; If peak > 0: rising = intStart <= norm <= peak; falling = peak <= norm <= intEnd
+        ; If peak < 0: rising = intStart >= norm >= peak; falling = peak >= norm >= intEnd
+        ; The unified formulas work as long as we choose the right branch:
+        ;   norm "between intStart and peak" means it's nearer the start side
+        ;   norm "between peak and intEnd" means it's nearer the end side
+        ;
+        ; Test by comparing |norm| vs |peak|: if |norm| < |peak|, rising; else falling.
+        mov     rax, rcx
+        test    rax, rax
+        jns     .nA
+        neg     rax
+.nA:
+        mov     rsi, rbx
+        test    rsi, rsi
+        jns     .pA
+        neg     rsi
+.pA:
+        cmp     rax, rsi
+        jl      .rising
+
+.falling:
+        ; scalar = (intEnd - norm) / (intEnd - peak)
+        ; require norm in [peak, intEnd] (signed if peak>0, reverse if peak<0).
+        ; If sign(intEnd) != sign(peak) we'd have weird, but spec ensures same.
+        ; bounds check: norm beyond intEnd -> 0
+        test    rbx, rbx
+        js      .f_neg
+        cmp     rcx, r12
+        jg      .zero
+        jmp     .f_calc
+.f_neg:
+        cmp     rcx, r12
+        jl      .zero
+.f_calc:
+        mov     rax, r12
+        sub     rax, rcx
+        shl     rax, 14
+        mov     rdi, r12
+        sub     rdi, rbx
+        test    rdi, rdi
+        jz      .zero
+        cqo
+        idiv    rdi
+        mov     [_gv_scalar_q], rax
+        jmp     .ret
+
+.rising:
+        ; scalar = (norm - intStart) / (peak - intStart)
+        ; bounds check: norm before intStart -> 0
+        test    rbx, rbx
+        js      .r_neg
+        cmp     rcx, rdx
+        jl      .zero
+        jmp     .r_calc
+.r_neg:
+        cmp     rcx, rdx
+        jg      .zero
+.r_calc:
+        mov     rax, rcx
+        sub     rax, rdx
+        shl     rax, 14
+        mov     rdi, rbx
+        sub     rdi, rdx
+        test    rdi, rdi
+        jz      .zero
+        cqo
+        idiv    rdi
+        mov     [_gv_scalar_q], rax
+        jmp     .ret
+
+.one:
+        mov     qword [_gv_scalar_q], 16384
+        jmp     .ret
+.zero:
+        mov     qword [_gv_scalar_q], 0
+.ret:
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; apply_gvar_to_simple — apply gvar deltas to the just-parsed simple
+; glyph's points.  rdi = glyph_id, rsi = start_pts (base index into
+; pt_x[]/pt_y[] for this glyph's points).  Modifies pt_x[]/pt_y[].
+;
+; If no fvar/gvar or norm_coord_q == 0 (default master), returns early.
+; Multi-axis support is single-axis only (axis 0).  Only the outline's
+; real points are mutated; phantom-point deltas are ignored.
+apply_gvar_to_simple:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        push    rbp
+
+        mov     rbx, rdi                 ; glyph_id
+        mov     r15, rsi                 ; start_pts
+
+        cmp     qword [tbl_gvar_off], 0
+        je      .ret
+        cmp     qword [norm_coord_q], 0
+        je      .ret
+
+        ; gvar lookup
+        mov     rdi, rbx
+        call    gvar_lookup
+        test    rdx, rdx
+        jz      .ret
+        mov     r12, rax                 ; data ptr
+        mov     r13, rdx                 ; length
+        mov     rcx, r12
+        add     rcx, r13
+        mov     [_gv_data_end], rcx
+
+        ; npts_glyph = (out_numPoints - start_pts) + 4 phantom
+        mov     rax, [out_numPoints]
+        sub     rax, r15
+        add     rax, 4
+        mov     [_gv_npts_glyph], rax
+
+        ; r12 = start of GlyphVariationData. Read tvc + dataOffset.
+        mov     rdi, r12
+        call    be_u16
+        mov     rbp, rax                 ; tvc + flags (low 12 bits = count)
+        add     r12, 2
+        mov     rdi, r12
+        call    be_u16                   ; dataOffset (from start of GVD)
+        ; data_block = start_of_GVD + dataOffset = (r12 - 2) + dataOffset
+        mov     rcx, r12
+        sub     rcx, 2
+        add     rcx, rax
+        mov     [_gv_data_block], rcx
+        add     r12, 2                   ; r12 -> first TupleVariationHeader
+
+        mov     qword [_gv_shared_all], 0
+        mov     qword [_gv_shared_n], 0
+
+        ; If SHARED_POINT_NUMBERS bit (bit 15 of tvc) set, the shared
+        ; packed point list is at the start of the data block.
+        test    rbp, 0x8000
+        jz      .no_shared
+        mov     rdi, [_gv_data_block]
+        ; decode shared points into _gv_pts (temp), then move to _gv_shared
+        push    r12
+        call    gv_decode_points
+        pop     r12
+        ; copy _gv_pts -> _gv_shared
+        mov     rcx, [_gv_pts_n]
+        mov     [_gv_shared_n], rcx
+        xor     rbx, rbx
+.cs:
+        cmp     rbx, rcx
+        jge     .cs_done
+        movzx   eax, word [_gv_pts + rbx*2]
+        mov     [_gv_shared + rbx*2], ax
+        inc     rbx
+        jmp     .cs
+.cs_done:
+        ; Advance the data-block pointer past the shared points block.
+        mov     [_gv_data_block], rdi
+.no_shared:
+
+        ; tuple count = low 12 bits of rbp
+        and     rbp, 0x0FFF
+        mov     r14, rbp                 ; remaining tuples
+
+.tuple_loop:
+        test    r14, r14
+        jz      .ret
+
+        ; Tuple header:
+        ;   u16 variationDataSize
+        ;   u16 tupleIndex (flags + sharedTupleRecordsIndex)
+        ;   F2DOT14 peakTuple[axisCount]    (if EMBEDDED_PEAK_TUPLE)
+        ;   F2DOT14 intermediateStartTuple[axisCount]
+        ;   F2DOT14 intermediateEndTuple[axisCount]   (both if INTERMEDIATE_REGION)
+        mov     rdi, r12
+        call    be_u16
+        mov     [_gv_size_tmp], rax       ; variationDataSize
+        add     r12, 2
+        mov     rdi, r12
+        call    be_u16
+        mov     rbx, rax                  ; tupleIndex flags + idx
+        add     r12, 2
+
+        ; peak (single axis assumed)
+        test    rbx, 0x8000               ; EMBEDDED_PEAK_TUPLE
+        jz      .shared_peak
+        mov     rdi, r12
+        call    be_u16
+        mov     [_gv_peak], ax
+        add     r12, 2
+        jmp     .have_peak
+.shared_peak:
+        ; peak from shared tuples table at index (low 12 bits of rbx)
+        mov     rcx, rbx
+        and     rcx, 0x0FFF
+        mov     rdi, [gvar_shared_ptr]
+        ; each shared tuple = axisCount * F2DOT14 (we assume axisCount=1, so 2 bytes)
+        lea     rdi, [rdi + rcx*2]
+        call    be_u16
+        mov     [_gv_peak], ax
+.have_peak:
+
+        mov     qword [_gv_have_intermediate], 0
+        test    rbx, 0x4000               ; INTERMEDIATE_REGION
+        jz      .no_int
+        mov     rdi, r12
+        call    be_u16
+        mov     [_gv_int_start], ax
+        add     r12, 2
+        mov     rdi, r12
+        call    be_u16
+        mov     [_gv_int_end], ax
+        add     r12, 2
+        mov     qword [_gv_have_intermediate], 1
+.no_int:
+
+        ; Compute scalar.
+        call    gv_compute_scalar
+
+        ; If scalar == 0, skip to next tuple.
+        cmp     qword [_gv_scalar_q], 0
+        je      .skip_tuple
+
+        ; --- decode the per-tuple data block at _gv_data_block ---
+        mov     rdi, [_gv_data_block]
+        ; If PRIVATE_POINT_NUMBERS bit (0x2000) set, private points list
+        ; first; else use shared.
+        test    rbx, 0x2000
+        jnz     .private_pts
+        ; copy _gv_shared -> _gv_pts
+        mov     rcx, [_gv_shared_n]
+        mov     [_gv_pts_n], rcx
+        xor     rdx, rdx
+.cp_sh:
+        cmp     rdx, rcx
+        jge     .cp_sh_done
+        movzx   eax, word [_gv_shared + rdx*2]
+        mov     [_gv_pts + rdx*2], ax
+        inc     rdx
+        jmp     .cp_sh
+.cp_sh_done:
+        jmp     .deltas
+.private_pts:
+        call    gv_decode_points
+.deltas:
+        ; X deltas
+        push    rdi
+        lea     rsi, [_gv_x_deltas]
+        pop     rdi
+        push    rsi
+        push    rdi
+        ; gv_decode_deltas(rdi, rsi)
+        ; We just set both above; reload cleanly:
+        pop     rdi
+        pop     rsi
+        call    gv_decode_deltas
+        ; Y deltas
+        lea     rsi, [_gv_y_deltas]
+        call    gv_decode_deltas
+
+        ; Apply scalar*delta to pt_x[start_pts + pt]/pt_y[start_pts + pt]
+        ; for each pt in _gv_pts where pt < (out_numPoints - start_pts).
+        mov     rcx, [_gv_pts_n]
+        mov     rax, [out_numPoints]
+        sub     rax, r15
+        ; rax = max real points (4 phantom points beyond are out of bounds)
+        push    rax
+        xor     rdx, rdx
+.app_loop:
+        cmp     rdx, rcx
+        jge     .app_done
+        movzx   r8d, word [_gv_pts + rdx*2]
+        cmp     r8, qword [rsp]
+        jge     .app_skip
+        ; xdelta * scalar / 16384
+        movsx   rax, word [_gv_x_deltas + rdx*2]
+        imul    rax, [_gv_scalar_q]
+        sar     rax, 14
+        mov     r9, r15
+        add     r9, r8
+        add     [pt_x + r9*4], eax
+        ; ydelta * scalar / 16384
+        movsx   rax, word [_gv_y_deltas + rdx*2]
+        imul    rax, [_gv_scalar_q]
+        sar     rax, 14
+        add     [pt_y + r9*4], eax
+.app_skip:
+        inc     rdx
+        jmp     .app_loop
+.app_done:
+        pop     rax
+        ; Advance _gv_data_block past the consumed bytes (variationDataSize)
+        mov     rax, [_gv_data_block]
+        add     rax, [_gv_size_tmp]
+        mov     [_gv_data_block], rax
+        jmp     .next_tuple
+
+.skip_tuple:
+        ; Just advance data block.
+        mov     rax, [_gv_data_block]
+        add     rax, [_gv_size_tmp]
+        mov     [_gv_data_block], rax
+
+.next_tuple:
+        dec     r14
+        jmp     .tuple_loop
+
+.ret:
+        pop     rbp
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
         ret
 
 ; ---------------------------------------------------------------------
