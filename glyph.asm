@@ -204,6 +204,10 @@ str_glyph_ids:          resd MAX_STR_GLYPHS
 str_pen_x_fix:          resd MAX_STR_GLYPHS  ; 16.16 pen x for each glyph (left edge in big pixels)
 str_baseline_fix:       resq 1               ; baseline y in big pixels 16.16 (= ascent * scaleFix)
 
+; ---- parse_simple_into transient state (single-call only — no recursion) ----
+_ps_nc:                 resq 1
+_ps_npts:               resq 1
+
 ; ---- parsed outline (simple glyph) ----
 %define MAX_POINTS      2048
 %define MAX_CONTOURS    64
@@ -376,8 +380,6 @@ _start:
         je      .empty_glyph
 
         call    parse_glyf
-        cmp     eax, 1
-        je      .err_compos
         cmp     eax, 2
         je      .err_too_many
 
@@ -482,8 +484,6 @@ _start:
         push    rbx
         call    parse_glyf
         pop     rbx
-        cmp     eax, 1
-        je      .s_skip_glyph            ; composite -> skip
         cmp     eax, 2
         je      .err_too_many
 
@@ -1290,48 +1290,22 @@ dump_parsed:
         ret
 
 ; ---------------------------------------------------------------------
-; parse_glyf — parse the simple glyph at [glyf_off] into BSS arrays.
-; Returns rax = 0 ok, 1 = composite (unsupported), 2 = too large.
+; parse_glyf — TOP-LEVEL entry. Resets accumulators, sets bbox from
+; this glyph's own header, then dispatches to the simple or composite
+; parser. Returns 0 ok, 2 if storage exhausted.
 ;
 ; Glyph header (10 bytes):
-;   i16 numContours    (negative = composite, deferred)
+;   i16 numContours    (negative = composite)
 ;   i16 xMin, yMin, xMax, yMax
-;
-; Simple glyph body:
-;   u16 endPtsOfContours[numContours]
-;   u16 instructionLength
-;   u8  instructions[instructionLength]
-;   u8  flags[numPoints]   (with REPEAT bit handling)
-;   u8/u16 xCoords[numPoints]   (delta encoding, sign + size from flags)
-;   u8/u16 yCoords[numPoints]   (same)
-;
-; Flag bits:
-;   0x01 ON_CURVE
-;   0x02 X_SHORT_VECTOR
-;   0x04 Y_SHORT_VECTOR
-;   0x08 REPEAT_FLAG
-;   0x10 X_IS_SAME (or POSITIVE_X_SHORT)
-;   0x20 Y_IS_SAME (or POSITIVE_Y_SHORT)
 parse_glyf:
         push    rbx
         push    r12
-        push    r13
-        push    r14
-        push    r15
 
-        mov     r12, [glyf_off]          ; r12 = walking pointer
+        mov     qword [out_numPoints], 0
+        mov     qword [out_numContours], 0
 
-        ; numContours
-        mov     rdi, r12
-        call    be_i16
-        mov     [out_numContours], rax
-        test    rax, rax
-        js      .composite               ; negative = composite
+        mov     r12, [glyf_off]
 
-        cmp     rax, MAX_CONTOURS
-        ja      .toomany
-
-        ; bbox
         lea     rdi, [r12 + 2]
         call    be_i16
         mov     [out_xMin], rax
@@ -1345,143 +1319,324 @@ parse_glyf:
         call    be_i16
         mov     [out_yMax], rax
 
-        add     r12, 10                  ; r12 -> endPtsOfContours[0]
+        mov     rdi, r12
+        call    be_i16
+        test    rax, rax
+        js      .composite
 
-        ; read endPtsOfContours into contour_end[]
-        mov     r13, [out_numContours]   ; r13 = nc
-        xor     ebx, ebx
+        ; simple top-level
+        mov     rdi, r12
+        xor     esi, esi
+        xor     edx, edx
+        call    parse_simple_into
+        jmp     .ret
+
+.composite:
+        mov     rdi, r12
+        call    parse_composite_into
+
+.ret:
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; parse_simple_into(rdi=glyf_off, rsi=dx_font, rdx=dy_font)
+; Appends a simple glyph's points/contours starting at out_numPoints/
+; out_numContours, adding (dx,dy) to all coords (font units).
+; Returns 0 ok, 2 storage exhausted.
+;
+; Flag bits:
+;   0x01 ON_CURVE   0x02 X_SHORT   0x04 Y_SHORT
+;   0x08 REPEAT     0x10 X_IS_SAME 0x20 Y_IS_SAME
+parse_simple_into:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        push    rbp
+
+        mov     r12, rdi                 ; walking pointer
+        mov     r15, rsi                 ; dx
+        mov     rbp, rdx                 ; dy
+        mov     r13, [out_numPoints]     ; start_pts
+        mov     r14, [out_numContours]   ; start_contours
+
+        mov     rdi, r12
+        call    be_i16
+        mov     [_ps_nc], rax
+
+        mov     rdi, r14
+        add     rdi, rax
+        cmp     rdi, MAX_CONTOURS
+        ja      .toomany
+
+        add     r12, 10
+
+        xor     rbx, rbx
 .ep_loop:
-        cmp     rbx, r13
+        cmp     rbx, [_ps_nc]
         jge     .ep_done
         mov     rdi, r12
         call    be_u16
-        mov     [contour_end + rbx*4], eax
+        add     rax, r13
+        mov     rcx, r14
+        add     rcx, rbx
+        mov     [contour_end + rcx*4], eax
         add     r12, 2
-        inc     ebx
+        inc     rbx
         jmp     .ep_loop
 .ep_done:
-        ; numPoints = endPtsOfContours[nc-1] + 1
-        dec     rbx
-        mov     eax, [contour_end + rbx*4]
-        inc     eax
-        mov     [out_numPoints], rax
-        cmp     rax, MAX_POINTS
+        mov     rcx, r14
+        add     rcx, [_ps_nc]
+        dec     rcx
+        mov     eax, [contour_end + rcx*4]
+        sub     rax, r13
+        inc     rax
+        mov     [_ps_npts], rax
+
+        mov     rdi, r13
+        add     rdi, rax
+        cmp     rdi, MAX_POINTS
         ja      .toomany
+        mov     [out_numPoints], rdi
+        mov     rdi, r14
+        add     rdi, [_ps_nc]
+        mov     [out_numContours], rdi
 
         ; skip instructions
         mov     rdi, r12
         call    be_u16
         add     r12, 2
-        add     r12, rax                 ; skip past instructions
+        add     r12, rax
 
-        ; ---- decode flags[numPoints] (with REPEAT) ----
-        mov     r13, [out_numPoints]
-        xor     ebx, ebx                 ; ebx = point index
+        ; flags (with REPEAT) -> pt_flags[r13 + i]
+        xor     rbx, rbx
 .fl_loop:
-        cmp     rbx, r13
+        cmp     rbx, [_ps_npts]
         jge     .fl_done
         movzx   eax, byte [r12]
         inc     r12
-        mov     [pt_flags + rbx], al
+        mov     rdi, r13
+        add     rdi, rbx
+        mov     [pt_flags + rdi], al
         inc     rbx
-        test    al, 0x08                 ; REPEAT bit
+        test    al, 0x08
         jz      .fl_loop
-        ; next byte is a u8 repeat count
         movzx   ecx, byte [r12]
         inc     r12
 .fl_rep:
         test    ecx, ecx
         jz      .fl_loop
-        cmp     rbx, r13
+        cmp     rbx, [_ps_npts]
         jge     .fl_done
-        mov     [pt_flags + rbx], al
+        mov     rdi, r13
+        add     rdi, rbx
+        mov     [pt_flags + rdi], al
         inc     rbx
         dec     ecx
         jmp     .fl_rep
 .fl_done:
 
-        ; ---- decode xCoords (delta) ----
-        ; r14 = running absolute x
-        xor     r14, r14
-        xor     ebx, ebx
+        ; xCoords -> pt_x[r13 + i], accumulator starts at dx
+        mov     r9, r15
+        xor     rbx, rbx
 .xc_loop:
-        cmp     rbx, r13
+        cmp     rbx, [_ps_npts]
         jge     .xc_done
-        movzx   eax, byte [pt_flags + rbx]
-        ; X_SHORT (bit 1) ?
+        mov     rdi, r13
+        add     rdi, rbx
+        movzx   eax, byte [pt_flags + rdi]
         test    al, 0x02
         jnz     .x_short
-        ; long: if X_IS_SAME (bit 4), delta = 0
         test    al, 0x10
         jnz     .x_same
-        ; else 2-byte signed delta
         mov     rdi, r12
         call    be_i16
-        add     r14, rax
+        add     r9, rax
         add     r12, 2
         jmp     .xc_store
 .x_short:
         movzx   eax, byte [r12]
         inc     r12
-        ; sign from POSITIVE_X bit (0x10): set => positive, clear => negative
-        movzx   ecx, byte [pt_flags + rbx]
+        mov     rdi, r13
+        add     rdi, rbx
+        movzx   ecx, byte [pt_flags + rdi]
         test    cl, 0x10
         jnz     .x_pos
         neg     eax
 .x_pos:
         movsx   rax, eax
-        add     r14, rax
+        add     r9, rax
         jmp     .xc_store
 .x_same:
-        ; delta = 0
 .xc_store:
-        mov     [pt_x + rbx*4], r14d
+        mov     rdi, r13
+        add     rdi, rbx
+        mov     [pt_x + rdi*4], r9d
         inc     rbx
         jmp     .xc_loop
 .xc_done:
 
-        ; ---- decode yCoords (delta) ----
-        xor     r14, r14
-        xor     ebx, ebx
+        ; yCoords -> pt_y[r13 + i], accumulator starts at dy
+        mov     r9, rbp
+        xor     rbx, rbx
 .yc_loop:
-        cmp     rbx, r13
+        cmp     rbx, [_ps_npts]
         jge     .yc_done
-        movzx   eax, byte [pt_flags + rbx]
-        test    al, 0x04                 ; Y_SHORT bit 2
+        mov     rdi, r13
+        add     rdi, rbx
+        movzx   eax, byte [pt_flags + rdi]
+        test    al, 0x04
         jnz     .y_short
-        test    al, 0x20                 ; Y_IS_SAME bit 5
+        test    al, 0x20
         jnz     .y_same
         mov     rdi, r12
         call    be_i16
-        add     r14, rax
+        add     r9, rax
         add     r12, 2
         jmp     .yc_store
 .y_short:
         movzx   eax, byte [r12]
         inc     r12
-        movzx   ecx, byte [pt_flags + rbx]
+        mov     rdi, r13
+        add     rdi, rbx
+        movzx   ecx, byte [pt_flags + rdi]
         test    cl, 0x20
         jnz     .y_pos
         neg     eax
 .y_pos:
         movsx   rax, eax
-        add     r14, rax
+        add     r9, rax
         jmp     .yc_store
 .y_same:
 .yc_store:
-        mov     [pt_y + rbx*4], r14d
+        mov     rdi, r13
+        add     rdi, rbx
+        mov     [pt_y + rdi*4], r9d
         inc     rbx
         jmp     .yc_loop
 .yc_done:
 
         xor     eax, eax
         jmp     .ret
-.composite:
-        mov     eax, 1
-        jmp     .ret
 .toomany:
         mov     eax, 2
 .ret:
+        pop     rbp
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; parse_composite_into(rdi=glyf_off)
+; Walks composite components, dispatching each to parse_simple_into
+; with the component's xy offset. Components that are themselves
+; composite (depth > 1) are skipped — nesting is rare in real fonts.
+
+%define CF_ARG_1_AND_2_ARE_WORDS 0x0001
+%define CF_ARGS_ARE_XY_VALUES    0x0002
+%define CF_WE_HAVE_A_SCALE       0x0008
+%define CF_MORE_COMPONENTS       0x0020
+%define CF_HAVE_X_AND_Y_SCALE    0x0040
+%define CF_HAVE_TWO_BY_TWO       0x0080
+
+parse_composite_into:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        push    rbp
+
+        mov     r12, rdi
+        add     r12, 10                  ; past header
+.next_comp:
+        mov     rdi, r12
+        call    be_u16
+        mov     r13, rax                 ; flags
+        add     r12, 2
+
+        mov     rdi, r12
+        call    be_u16
+        mov     r14, rax                 ; component glyph_id
+        add     r12, 2
+
+        ; arg1, arg2
+        test    r13, CF_ARG_1_AND_2_ARE_WORDS
+        jz      .args_byte
+        mov     rdi, r12
+        call    be_i16
+        mov     r15, rax
+        add     r12, 2
+        mov     rdi, r12
+        call    be_i16
+        mov     rbp, rax
+        add     r12, 2
+        jmp     .args_done
+.args_byte:
+        movsx   rax, byte [r12]
+        mov     r15, rax
+        inc     r12
+        movsx   rax, byte [r12]
+        mov     rbp, rax
+        inc     r12
+.args_done:
+
+        ; ARGS_ARE_XY_VALUES → use as offset; else point matching (skip)
+        test    r13, CF_ARGS_ARE_XY_VALUES
+        jnz     .have_xy
+        xor     r15, r15
+        xor     rbp, rbp
+.have_xy:
+
+        ; Skip optional transform bytes (we don't apply scale yet).
+        test    r13, CF_WE_HAVE_A_SCALE
+        jz      .check_xy_scale
+        add     r12, 2
+        jmp     .skip_xform_done
+.check_xy_scale:
+        test    r13, CF_HAVE_X_AND_Y_SCALE
+        jz      .check_2x2
+        add     r12, 4
+        jmp     .skip_xform_done
+.check_2x2:
+        test    r13, CF_HAVE_TWO_BY_TWO
+        jz      .skip_xform_done
+        add     r12, 8
+.skip_xform_done:
+
+        ; Look up component's glyf entry via loca.
+        mov     rdi, r14
+        call    loca_lookup              ; rax = abs ptr, rdx = length
+        test    rdx, rdx
+        jz      .skip_comp
+
+        ; If component is composite (numContours < 0), skip (no recursion).
+        push    rax
+        mov     rdi, rax
+        call    be_i16
+        pop     rdi
+        test    rax, rax
+        js      .skip_comp
+
+        ; parse_simple_into(rdi=glyf_off, rsi=dx, rdx=dy)
+        mov     rsi, r15
+        mov     rdx, rbp
+        call    parse_simple_into
+        cmp     eax, 2
+        je      .done
+
+.skip_comp:
+        test    r13, CF_MORE_COMPONENTS
+        jnz     .next_comp
+
+.done:
+        pop     rbp
         pop     r15
         pop     r14
         pop     r13
@@ -2568,6 +2723,76 @@ dump_metrics:
         ret
 
 ; ---------------------------------------------------------------------
+; utf8_next — decode one UTF-8 codepoint.
+;   in : rdi = pointer into string
+;   out: rax = codepoint (0 at NUL terminator)
+;        rdi = pointer past the consumed bytes
+; Handles 1/2/3/4-byte sequences. Malformed input yields the raw byte
+; (and advances by 1) — best-effort, no validation.
+utf8_next:
+        movzx   eax, byte [rdi]
+        test    al, al
+        jz      .done                    ; rax=0, rdi unchanged
+        test    al, 0x80
+        jz      .one                     ; ASCII fast path
+        ; multibyte
+        mov     ecx, eax
+        and     ecx, 0xE0
+        cmp     ecx, 0xC0                ; 110xxxxx -> 2 bytes
+        je      .two
+        mov     ecx, eax
+        and     ecx, 0xF0
+        cmp     ecx, 0xE0                ; 1110xxxx -> 3 bytes
+        je      .three
+        mov     ecx, eax
+        and     ecx, 0xF8
+        cmp     ecx, 0xF0                ; 11110xxx -> 4 bytes
+        je      .four
+        ; malformed leading byte: return raw, advance 1
+        inc     rdi
+        ret
+.one:
+        inc     rdi
+        ret
+.two:
+        and     eax, 0x1F                ; low 5 bits
+        shl     eax, 6
+        movzx   ecx, byte [rdi + 1]
+        and     ecx, 0x3F
+        or      eax, ecx
+        add     rdi, 2
+        ret
+.three:
+        and     eax, 0x0F
+        shl     eax, 12
+        movzx   ecx, byte [rdi + 1]
+        and     ecx, 0x3F
+        shl     ecx, 6
+        or      eax, ecx
+        movzx   ecx, byte [rdi + 2]
+        and     ecx, 0x3F
+        or      eax, ecx
+        add     rdi, 3
+        ret
+.four:
+        and     eax, 0x07
+        shl     eax, 18
+        movzx   ecx, byte [rdi + 1]
+        and     ecx, 0x3F
+        shl     ecx, 12
+        or      eax, ecx
+        movzx   ecx, byte [rdi + 2]
+        and     ecx, 0x3F
+        shl     ecx, 6
+        or      eax, ecx
+        movzx   ecx, byte [rdi + 3]
+        and     ecx, 0x3F
+        or      eax, ecx
+        add     rdi, 4
+.done:
+        ret
+
+; ---------------------------------------------------------------------
 ; hmtx_advance — rdi = glyph_id, returns rax = advance width (font units).
 ; hmtx layout:
 ;   numberOfHMetrics × { u16 advanceWidth; i16 lsb }
@@ -2620,26 +2845,29 @@ string_prepass:
         xor     r14, r14                 ; pen_x_fix accumulator (16.16 big-pixel)
         xor     r15, r15                 ; index
 .l:
-        movzx   eax, byte [r12 + r15]
-        test    al, al
+        ; UTF-8 decode at [r12 + ...]; advance r12 past the consumed bytes.
+        ; rax = codepoint, 0 = end.
+        mov     rdi, r12
+        call    utf8_next
+        test    rax, rax
         jz      .done
+        mov     r12, rdi                 ; r12 advances past the decoded char
+
         cmp     r15, MAX_STR_GLYPHS
         jge     .toolong
 
-        ; cmap lookup
         push    rax
         mov     rdi, rax
         call    cmap_lookup
-        mov     rbx, rax                 ; rbx = glyph_id (0 if missing)
+        mov     rbx, rax                 ; glyph_id
         pop     rax
 
         mov     [str_glyph_ids + r15*4], ebx
         mov     [str_pen_x_fix + r15*4], r14d
 
-        ; advance (in font units) -> add to pen_x_fix
         mov     rdi, rbx
         call    hmtx_advance
-        imul    rax, r13                 ; advance * scaleFix (in 16.16 big-pixel)
+        imul    rax, r13                 ; advance * scaleFix
         add     r14, rax
 
         inc     r15
