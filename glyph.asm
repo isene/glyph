@@ -27,6 +27,7 @@
 section .data
 
 usage_msg:      db "usage: glyph FONT.ttf CODEPOINT SIZE", 10
+                db "       glyph FONT.ttf STRING SIZE", 10
 usage_len       equ $ - usage_msg
 
 err_open:       db "glyph: open failed", 10
@@ -61,6 +62,9 @@ err_too_big_len equ $ - err_too_big
 
 err_edges:      db "glyph: too many edges", 10
 err_edges_len   equ $ - err_edges
+
+err_str_long:   db "glyph: string too long (max 256 chars)", 10
+err_str_long_len equ $ - err_str_long
 
 pgm_magic:      db "P5", 10
 pgm_magic_len   equ $ - pgm_magic
@@ -191,6 +195,15 @@ glyph_id:               resq 1
 glyf_off:               resq 1          ; absolute file offset of this glyph's glyf entry
 glyf_len:               resq 1          ; bytes (0 = empty glyph)
 
+; ---- string mode ----
+%define MAX_STR_GLYPHS  256
+str_mode:               resq 1          ; 0 = single CP, 1 = string
+str_len:                resq 1          ; chars in argv string
+str_total_W:            resq 1          ; total pixel width
+str_glyph_ids:          resd MAX_STR_GLYPHS
+str_pen_x_fix:          resd MAX_STR_GLYPHS  ; 16.16 pen x for each glyph (left edge in big pixels)
+str_baseline_fix:       resq 1               ; baseline y in big pixels 16.16 (= ascent * scaleFix)
+
 ; ---- parsed outline (simple glyph) ----
 %define MAX_POINTS      2048
 %define MAX_CONTOURS    64
@@ -248,7 +261,6 @@ global _start
 
 _start:
         mov     rbp, rsp                ; for argv access
-        ; argc at [rbp], argv at [rbp+8 .. ]
         mov     rax, [rbp]              ; argc
         cmp     rax, 4
         jne     .usage
@@ -256,13 +268,25 @@ _start:
         mov     rdi, [rbp + 16]         ; argv[1] = font path
         mov     [arg_font_path], rdi
 
-        mov     rdi, [rbp + 24]         ; argv[2] = codepoint (decimal)
-        call    parse_decimal
-        mov     [arg_codepoint], rax
-
-        mov     rdi, [rbp + 32]         ; argv[3] = size
+        mov     rdi, [rbp + 32]         ; argv[3] = size (always last)
         call    parse_decimal
         mov     [arg_size], rax
+
+        ; Decide string vs single-CP mode by argv[2][0]: digit -> CP, else string.
+        mov     rdi, [rbp + 24]
+        movzx   eax, byte [rdi]
+        sub     eax, '0'
+        cmp     eax, 9
+        ja      .string_mode
+
+        ; --- single-codepoint mode (legacy CLI) ---
+        mov     qword [str_mode], 0
+        call    parse_decimal
+        mov     [arg_codepoint], rax
+        jmp     .have_args
+.string_mode:
+        mov     qword [str_mode], 1
+.have_args:
 
         ; --- open font ---
         mov     rax, SYS_OPEN
@@ -333,7 +357,10 @@ _start:
         test    rax, rax
         jnz     .err_cmap
 
-        ; --- resolve codepoint -> glyph_id -> glyf entry ---
+        cmp     qword [str_mode], 0
+        jne     .render_string
+
+        ; ===== single-codepoint mode =====
         mov     rdi, [arg_codepoint]
         call    cmap_lookup
         mov     [glyph_id], rax
@@ -345,11 +372,8 @@ _start:
         mov     [glyf_off], rax
         mov     [glyf_len], rdx
 
-        call    dump_parsed
-
-        ; --- parse glyf outline ---
         cmp     qword [glyf_len], 0
-        je      .empty_glyph             ; empty glyph (e.g. space)
+        je      .empty_glyph
 
         call    parse_glyf
         cmp     eax, 1
@@ -357,43 +381,129 @@ _start:
         cmp     eax, 2
         je      .err_too_many
 
-        call    dump_outline
-
-        ; --- compute metrics (W, H, scaleFix) ---
         call    compute_metrics
         cmp     qword [img_W], MAX_OUT_DIM
         ja      .err_too_big
         cmp     qword [img_H], MAX_OUT_DIM
         ja      .err_too_big
 
-        ; --- transform points to big-pixel 16.16 ---
+        ; pen_x_fix = -xMin*scaleFix; baseline_fix = yMax*scaleFix (legacy tight bbox)
+        mov     rax, [out_xMin]
+        neg     rax
+        imul    rax, [img_scaleFix]
+        mov     rdi, rax
+        mov     rax, [out_yMax]
+        imul    rax, [img_scaleFix]
+        mov     rsi, rax
         call    transform_points
 
-        ; --- generate edges from contours ---
+        mov     qword [e_count], 0
         call    generate_edges
         cmp     eax, 1
         je      .err_edges
 
-        call    dump_metrics
-
-        ; --- clear supersample buffer ---
         call    clear_big_buffer
-
-        ; --- rasterize ---
         call    rasterize
-
-        ; --- box-filter to output_buf ---
         call    box_filter
-
-        ; --- emit PGM to stdout ---
         call    emit_pgm
-
         xor     edi, edi
         jmp     .exit
 
 .empty_glyph:
-        ; emit a 1x1 zero PGM so callers see a valid file
         call    emit_empty_pgm
+        xor     edi, edi
+        jmp     .exit
+
+.render_string:
+        ; ===== string mode =====
+        mov     rdi, [rbp + 24]          ; argv[2]
+        call    string_prepass           ; fills str_glyph_ids[], str_pen_x_fix[], str_total_W, str_len
+        cmp     rax, 1
+        je      .err_str_long
+
+        ; Compute image H = (ascent - descent) * arg_size / unitsPerEm
+        ; (descent stored as signed negative)
+        mov     rax, [hhea_ascent]
+        sub     rax, [hhea_descent]
+        mov     rcx, [arg_size]
+        imul    rax, rcx
+        mov     rcx, [head_unitsPerEm]
+        add     rax, rcx
+        dec     rax
+        xor     edx, edx
+        div     rcx
+        mov     [img_H], rax
+
+        mov     rax, [str_total_W]
+        mov     [img_W], rax
+
+        cmp     qword [img_W], MAX_OUT_DIM
+        ja      .err_too_big
+        cmp     qword [img_H], MAX_OUT_DIM
+        ja      .err_too_big
+
+        mov     rax, [img_W]
+        shl     rax, 2
+        mov     [img_bigW], rax
+        mov     rax, [img_H]
+        shl     rax, 2
+        mov     [img_bigH], rax
+
+        ; scaleFix
+        mov     rax, [arg_size]
+        shl     rax, 2
+        shl     rax, 16
+        xor     edx, edx
+        div     qword [head_unitsPerEm]
+        mov     [img_scaleFix], rax
+
+        mov     qword [e_count], 0
+        call    clear_big_buffer
+
+        ; baseline_fix = ascent * scaleFix (in big-pixel 16.16)
+        mov     rax, [hhea_ascent]
+        imul    rax, [img_scaleFix]
+        mov     [str_baseline_fix], rax
+
+        ; iterate string: parse outline + transform + accumulate edges
+        xor     rbx, rbx
+.s_loop:
+        cmp     rbx, [str_len]
+        jge     .s_done
+        movsxd  rax, dword [str_glyph_ids + rbx*4]
+        test    rax, rax
+        jz      .s_skip_glyph            ; missing glyph -> blank
+        mov     rdi, rax
+        call    loca_lookup
+        mov     [glyf_off], rax
+        mov     [glyf_len], rdx
+        cmp     qword [glyf_len], 0
+        je      .s_skip_glyph
+        push    rbx
+        call    parse_glyf
+        pop     rbx
+        cmp     eax, 1
+        je      .s_skip_glyph            ; composite -> skip
+        cmp     eax, 2
+        je      .err_too_many
+
+        ; transform with this glyph's pen_x_fix and the shared baseline.
+        movsxd  rax, dword [str_pen_x_fix + rbx*4]
+        mov     rdi, rax                 ; pen_x_fix arg
+        mov     rsi, [str_baseline_fix]
+        push    rbx
+        call    transform_points
+        call    generate_edges
+        pop     rbx
+        cmp     eax, 1
+        je      .err_edges
+.s_skip_glyph:
+        inc     rbx
+        jmp     .s_loop
+.s_done:
+        call    rasterize
+        call    box_filter
+        call    emit_pgm
         xor     edi, edi
         jmp     .exit
 
@@ -459,6 +569,11 @@ _start:
 .err_edges:
         lea     rsi, [err_edges]
         mov     edx, err_edges_len
+        jmp     .err_print
+
+.err_str_long:
+        lea     rsi, [err_str_long]
+        mov     edx, err_str_long_len
         jmp     .err_print
 
 .err_print:
@@ -1484,16 +1599,21 @@ compute_metrics:
 ; transform_points — pt_x[i],pt_y[i] (font units) -> big_x[i],big_y[i]
 ; in 16.16 fixed-point, big-pixel coordinate space (Y flipped).
 ;
-;   big_x = (fx - xMin) * scaleFix
-;   big_y = (yMax - fy) * scaleFix
+;   big_x = pen_x_fix + fx * scaleFix
+;   big_y = baseline_y_fix - fy * scaleFix
+;
+; Args:
+;   rdi = pen_x_fix       (16.16, left-edge anchor in big pixels)
+;   rsi = baseline_y_fix  (16.16, baseline y in big pixels)
 transform_points:
         push    rbx
         push    r12
         push    r13
         push    r14
+        push    r15
 
-        mov     r13, [out_xMin]
-        mov     r14, [out_yMax]
+        mov     r13, rdi                 ; pen_x_fix
+        mov     r14, rsi                 ; baseline_y_fix
         mov     r12, [img_scaleFix]
 
         mov     rcx, [out_numPoints]
@@ -1503,20 +1623,20 @@ transform_points:
         jge     .done
 
         movsxd  rax, dword [pt_x + rbx*4]
-        sub     rax, r13
         imul    rax, r12
+        add     rax, r13
         mov     [big_x + rbx*4], eax
 
         movsxd  rax, dword [pt_y + rbx*4]
+        imul    rax, r12
         mov     rdx, r14
         sub     rdx, rax
-        mov     rax, rdx
-        imul    rax, r12
-        mov     [big_y + rbx*4], eax
+        mov     [big_y + rbx*4], edx
 
         inc     rbx
         jmp     .loop
 .done:
+        pop     r15
         pop     r14
         pop     r13
         pop     r12
@@ -1824,7 +1944,8 @@ generate_edges:
         push    r15
         push    rbp
 
-        mov     qword [e_count], 0
+        ; e_count is NOT reset — callers reset before the first glyph
+        ; so that string-mode rendering can accumulate edges across glyphs.
 
         mov     r15, [out_numContours]
         test    r15, r15
@@ -2443,6 +2564,105 @@ dump_metrics:
         mov     edx, 1
         mov     eax, SYS_WRITE
         syscall
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; hmtx_advance — rdi = glyph_id, returns rax = advance width (font units).
+; hmtx layout:
+;   numberOfHMetrics × { u16 advanceWidth; i16 lsb }
+;   then (numGlyphs - numberOfHMetrics) × i16 lsb (advance shared with last)
+hmtx_advance:
+        push    rbx
+        mov     rbx, rdi
+        mov     rcx, [hhea_numLongMetrics]
+        cmp     rbx, rcx
+        jl      .normal
+        ; clamp to last entry
+        mov     rbx, rcx
+        dec     rbx
+.normal:
+        mov     rdi, [font_base]
+        add     rdi, [tbl_hmtx_off]
+        lea     rdi, [rdi + rbx*4]
+        call    be_u16
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; string_prepass — rdi = pointer to null-terminated ASCII string.
+; Walks the string. For each byte: cmap_lookup -> glyph_id; record
+; pen_x_fix in big-pixel 16.16; sum advances. Stores str_glyph_ids[],
+; str_pen_x_fix[], str_total_W (in OUTPUT pixels), str_len.
+;
+; scaleFix isn't computed yet here (we don't know img_W until total
+; advance is known); use a per-pixel "advanceFix" = arg_size * SS *
+; 65536 / unitsPerEm (same as scaleFix).
+;
+; Returns rax = 0 ok, 1 = string too long.
+string_prepass:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+
+        mov     r12, rdi                 ; str pointer
+
+        ; advanceFix = arg_size * SS * 65536 / unitsPerEm (16.16 big-pixel scale)
+        mov     rax, [arg_size]
+        shl     rax, 2                   ; * SS
+        shl     rax, 16                  ; * 65536
+        xor     edx, edx
+        div     qword [head_unitsPerEm]
+        mov     r13, rax                 ; r13 = scaleFix
+
+        xor     r14, r14                 ; pen_x_fix accumulator (16.16 big-pixel)
+        xor     r15, r15                 ; index
+.l:
+        movzx   eax, byte [r12 + r15]
+        test    al, al
+        jz      .done
+        cmp     r15, MAX_STR_GLYPHS
+        jge     .toolong
+
+        ; cmap lookup
+        push    rax
+        mov     rdi, rax
+        call    cmap_lookup
+        mov     rbx, rax                 ; rbx = glyph_id (0 if missing)
+        pop     rax
+
+        mov     [str_glyph_ids + r15*4], ebx
+        mov     [str_pen_x_fix + r15*4], r14d
+
+        ; advance (in font units) -> add to pen_x_fix
+        mov     rdi, rbx
+        call    hmtx_advance
+        imul    rax, r13                 ; advance * scaleFix (in 16.16 big-pixel)
+        add     r14, rax
+
+        inc     r15
+        jmp     .l
+.done:
+        mov     [str_len], r15
+
+        ; total_W in OUTPUT pixels = ceil(pen_x_fix / 65536 / SS)
+        mov     rax, r14
+        add     rax, (65536 * SS) - 1    ; round up
+        shr     rax, 16
+        shr     rax, 2                   ; / SS
+        mov     [str_total_W], rax
+
+        xor     eax, eax
+        jmp     .ret
+.toolong:
+        mov     eax, 1
+.ret:
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
         pop     rbx
         ret
 
