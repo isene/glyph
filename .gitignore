@@ -1,2 +1,4 @@
 *.o
 glyph
+test_lib
+test_lib.o

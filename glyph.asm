@@ -1,9 +1,19 @@
 ; glyph - pure x86_64 asm TTF rasterizer
-; usage: glyph FONT.ttf CODEPOINT SIZE > out.pgm
-; build: nasm -f elf64 glyph.asm -o glyph.o && ld glyph.o -o glyph
 ;
-; Phase 1 (this file): skeleton, mmap, SFNT directory dump to stderr.
-; Future phases add cmap/glyf parsing and the rasterizer.
+; Two build modes (selected by `GLYPH_LIB` preprocessor define):
+;   default        -> CLI tool, includes _start + PGM output to stdout
+;                     `nasm -f elf64 glyph.asm -o glyph.o && ld glyph.o -o glyph`
+;   GLYPH_LIB set  -> engine only (no _start, no PGM, no argv parsing)
+;                     intended for %include from other CHasm tools (e.g. glass)
+;                     via the thin glyph.inc shim.
+;
+; Public engine API (always available):
+;   glyph_load_font(rdi=path)              -> rax=0 ok / 1..6 error
+;   glyph_set_weight(rdi=weight)           -> sets variation weight
+;   glyph_render_to_alpha(rdi=cp, rsi=size)
+;       -> rax=0 ok / 1=missing / 3=oversize
+;          rcx=W rdx=H r8=bearing_x r9=bearing_y r10=advance
+;          alpha mask in output_buf (W*H bytes, 0..255)
 
 %define SYS_READ        0
 %define SYS_WRITE       1
@@ -26,6 +36,7 @@
 ; ---------------------------------------------------------------------
 section .data
 
+%ifndef GLYPH_LIB
 usage_msg:      db "usage: glyph FONT.ttf CODEPOINT SIZE [WEIGHT]", 10
                 db "       glyph FONT.ttf STRING SIZE [WEIGHT]", 10
                 db "       (WEIGHT only meaningful for variable fonts; default = fvar default, e.g. 400)", 10
@@ -121,6 +132,7 @@ dump_hdr_len    equ $ - dump_hdr
 
 space_str:      db " "
 nl_str:         db 10
+%endif  ; !GLYPH_LIB
 
 ; required tables (4-char ASCII tags, big-endian on disk so stored as-is)
 tag_head:       db "head"
@@ -227,14 +239,16 @@ glyph_id:               resq 1
 glyf_off:               resq 1          ; absolute file offset of this glyph's glyf entry
 glyf_len:               resq 1          ; bytes (0 = empty glyph)
 
-; ---- string mode ----
+%ifndef GLYPH_LIB
+; ---- string mode (CLI only) ----
 %define MAX_STR_GLYPHS  256
-str_mode:               resq 1          ; 0 = single CP, 1 = string
-str_len:                resq 1          ; chars in argv string
-str_total_W:            resq 1          ; total pixel width
+str_mode:               resq 1
+str_len:                resq 1
+str_total_W:            resq 1
 str_glyph_ids:          resd MAX_STR_GLYPHS
-str_pen_x_fix:          resd MAX_STR_GLYPHS  ; 16.16 pen x for each glyph (left edge in big pixels)
-str_baseline_fix:       resq 1               ; baseline y in big pixels 16.16 (= ascent * scaleFix)
+str_pen_x_fix:          resd MAX_STR_GLYPHS
+str_baseline_fix:       resq 1
+%endif
 
 ; ---- parse_simple_into transient state (single-call only — no recursion) ----
 _ps_nc:                 resq 1
@@ -314,11 +328,15 @@ big_buffer:             resb (MAX_BIG_DIM * MAX_BIG_DIM)
 ; output greyscale buffer
 output_buf:             resb (MAX_OUT_DIM * MAX_OUT_DIM)
 
-; PGM header scratch
+%ifndef GLYPH_LIB
+; PGM header scratch (CLI only)
 pgm_hdr:                resb 64
+%endif
 
 ; ---------------------------------------------------------------------
 section .text
+
+%ifndef GLYPH_LIB
 global _start
 
 _start:
@@ -362,136 +380,46 @@ _start:
         mov     qword [str_mode], 1
 .have_args:
 
-        ; --- open font ---
-        mov     rax, SYS_OPEN
+        ; --- load + parse the font (single API call) ---
         mov     rdi, [arg_font_path]
-        xor     esi, esi                ; O_RDONLY
-        xor     edx, edx
-        syscall
+        call    glyph_load_font
         test    rax, rax
-        js      .err_open
-        mov     [font_fd], rax
-
-        ; --- fstat for size ---
-        mov     rax, SYS_FSTAT
-        mov     rdi, [font_fd]
-        lea     rsi, [stat_buf]
-        syscall
-        test    rax, rax
-        js      .err_fstat
-
-        mov     rax, [stat_buf + ST_SIZE_OFF]
-        mov     [font_size], rax
-
-        ; --- mmap read-only ---
-        mov     rax, SYS_MMAP
-        xor     edi, edi                ; addr = NULL
-        mov     rsi, [font_size]
-        mov     edx, PROT_READ
-        mov     r10d, MAP_PRIVATE
-        mov     r8, [font_fd]
-        xor     r9d, r9d                ; offset = 0
-        syscall
-        cmp     rax, -4096
-        ja      .err_mmap
-        mov     [font_base], rax
-
-        ; --- close fd (mmap keeps file alive) ---
-        mov     rax, SYS_CLOSE
-        mov     rdi, [font_fd]
-        syscall
-
-        ; --- parse SFNT directory + populate table offsets ---
-        call    parse_sfnt
-        test    rax, rax
-        jnz     .err_sfnt
-
-        ; verify required tables found
-        cmp     qword [tbl_head_off], 0
+        jz      .loaded
+        cmp     rax, 1
+        je      .err_open
+        cmp     rax, 2
+        je      .err_fstat
+        cmp     rax, 3
+        je      .err_mmap
+        cmp     rax, 4
+        je      .err_sfnt
+        cmp     rax, 5
         je      .err_table
-        cmp     qword [tbl_maxp_off], 0
-        je      .err_table
-        cmp     qword [tbl_cmap_off], 0
-        je      .err_table
-        cmp     qword [tbl_glyf_off], 0
-        je      .err_table
-        cmp     qword [tbl_loca_off], 0
-        je      .err_table
-
-        ; --- dump tables to stderr ---
-        call    dump_tables
-
-        ; --- parse head, maxp, hhea ---
-        call    parse_head
-        call    parse_maxp
-        call    parse_hhea
-        call    parse_fvar              ; no-op if fvar absent
-        call    compute_norm_coord      ; based on arg_weight + fvar
-        call    parse_gvar              ; no-op if gvar absent
-
-        ; --- locate cmap format-4 subtable ---
-        call    find_cmap_format4
-        test    rax, rax
-        jnz     .err_cmap
+        cmp     rax, 6
+        je      .err_cmap
+.loaded:
+        ; weight already passed to arg_weight; recompute norm coord (load did
+        ; it once with the value we set before; re-do in case arg_weight was 0
+        ; and the font's fvar default differs)
+        mov     rdi, [arg_weight]
+        call    glyph_set_weight
 
         cmp     qword [str_mode], 0
         jne     .render_string
 
         ; ===== single-codepoint mode =====
         mov     rdi, [arg_codepoint]
-        call    cmap_lookup
-        mov     [glyph_id], rax
-        test    rax, rax
-        jz      .err_glyph
+        mov     rsi, [arg_size]
+        call    glyph_render_to_alpha
+        cmp     eax, 1
+        je      .err_glyph
+        cmp     eax, 3
+        je      .err_too_big
 
-        mov     rdi, rax
-        call    loca_lookup
-        mov     [glyf_off], rax
-        mov     [glyf_len], rdx
-
-        cmp     qword [glyf_len], 0
+        ; Empty glyph (no outline, e.g. space) — emit a placeholder PGM.
+        cmp     qword [img_W], 0
         je      .empty_glyph
 
-        call    parse_glyf
-        cmp     eax, 2
-        je      .err_too_many
-
-        ; Apply gvar to the OUTER simple glyph (if it is simple).
-        ; Composites get gvar applied per-component inside parse_composite_into.
-        mov     rdi, [glyf_off]
-        call    be_i16
-        test    rax, rax
-        js      .skip_single_gvar
-        mov     rdi, [glyph_id]
-        xor     rsi, rsi                  ; start_pts = 0
-        xor     rdx, rdx                  ; start_contours = 0
-        call    apply_gvar_to_simple
-.skip_single_gvar:
-
-        call    compute_metrics
-        cmp     qword [img_W], MAX_OUT_DIM
-        ja      .err_too_big
-        cmp     qword [img_H], MAX_OUT_DIM
-        ja      .err_too_big
-
-        ; pen_x_fix = -xMin*scaleFix; baseline_fix = yMax*scaleFix (legacy tight bbox)
-        mov     rax, [out_xMin]
-        neg     rax
-        imul    rax, [img_scaleFix]
-        mov     rdi, rax
-        mov     rax, [out_yMax]
-        imul    rax, [img_scaleFix]
-        mov     rsi, rax
-        call    transform_points
-
-        mov     qword [e_count], 0
-        call    generate_edges
-        cmp     eax, 1
-        je      .err_edges
-
-        call    clear_big_buffer
-        call    rasterize
-        call    box_filter
         call    emit_pgm
         xor     edi, edi
         jmp     .exit
@@ -688,6 +616,272 @@ _start:
         mov     eax, SYS_EXIT
         syscall
 
+%endif  ; !GLYPH_LIB
+
+; ---------------------------------------------------------------------
+; glyph_load_font — open + mmap + parse all required tables for a TTF.
+; Single-font global state (font_base, table offsets, etc.) is set up
+; for subsequent glyph_render_to_alpha calls.
+;
+;   in : rdi = pointer to null-terminated font file path
+;   out: rax = 0 ok, otherwise:
+;        1 = open failed     2 = fstat failed
+;        3 = mmap failed     4 = not an SFNT file
+;        5 = required table missing
+;        6 = no usable cmap subtable
+glyph_load_font:
+        push    rbx
+        mov     [arg_font_path], rdi
+
+        mov     rax, SYS_OPEN
+        mov     rdi, [arg_font_path]
+        xor     esi, esi
+        xor     edx, edx
+        syscall
+        test    rax, rax
+        js      .e_open
+        mov     [font_fd], rax
+
+        mov     rax, SYS_FSTAT
+        mov     rdi, [font_fd]
+        lea     rsi, [stat_buf]
+        syscall
+        test    rax, rax
+        js      .e_fstat
+        mov     rax, [stat_buf + ST_SIZE_OFF]
+        mov     [font_size], rax
+
+        mov     rax, SYS_MMAP
+        xor     edi, edi
+        mov     rsi, [font_size]
+        mov     edx, PROT_READ
+        mov     r10d, MAP_PRIVATE
+        mov     r8, [font_fd]
+        xor     r9d, r9d
+        syscall
+        cmp     rax, -4096
+        ja      .e_mmap
+        mov     [font_base], rax
+
+        mov     rax, SYS_CLOSE
+        mov     rdi, [font_fd]
+        syscall
+
+        call    parse_sfnt
+        test    rax, rax
+        jnz     .e_sfnt
+
+        cmp     qword [tbl_head_off], 0
+        je      .e_table
+        cmp     qword [tbl_maxp_off], 0
+        je      .e_table
+        cmp     qword [tbl_cmap_off], 0
+        je      .e_table
+        cmp     qword [tbl_glyf_off], 0
+        je      .e_table
+        cmp     qword [tbl_loca_off], 0
+        je      .e_table
+
+        call    parse_head
+        call    parse_maxp
+        call    parse_hhea
+        call    parse_fvar
+        call    compute_norm_coord
+        call    parse_gvar
+
+        call    find_cmap_format4
+        test    rax, rax
+        jnz     .e_cmap
+
+        xor     eax, eax
+        pop     rbx
+        ret
+.e_open:
+        mov     eax, 1
+        pop     rbx
+        ret
+.e_fstat:
+        mov     eax, 2
+        pop     rbx
+        ret
+.e_mmap:
+        mov     eax, 3
+        pop     rbx
+        ret
+.e_sfnt:
+        mov     eax, 4
+        pop     rbx
+        ret
+.e_table:
+        mov     eax, 5
+        pop     rbx
+        ret
+.e_cmap:
+        mov     eax, 6
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; glyph_set_weight — set the active variation weight (variable fonts).
+;   in : rdi = weight (0 = use font's fvar default)
+;        Recomputes norm_coord_q from arg_weight and fvar defaults.
+glyph_set_weight:
+        mov     [arg_weight], rdi
+        call    compute_norm_coord
+        ret
+
+; ---------------------------------------------------------------------
+; glyph_render_to_alpha — render a single glyph for a codepoint at
+; the requested pixel size. The alpha mask is left in output_buf
+; (img_W × img_H bytes, top-left origin, 0 = transparent, 255 = opaque).
+;
+;   in : rdi = codepoint   rsi = pixel_size
+;   out: rax = 0 ok, 1 = codepoint not in font, 2 = composite
+;             unsupported (only top-level composites cause this), 3 = oversize
+;        rcx = width                    rdx = height
+;        r8  = bearing_x (pixels)       r9  = bearing_y (pixels above baseline)
+;        r10 = advance (pixels)
+glyph_render_to_alpha:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+
+        mov     [arg_codepoint], rdi
+        mov     [arg_size], rsi
+
+        mov     rdi, [arg_codepoint]
+        call    cmap_lookup
+        test    rax, rax
+        jz      .e_glyph
+        mov     [glyph_id], rax
+
+        mov     rdi, rax
+        call    loca_lookup
+        mov     [glyf_off], rax
+        mov     [glyf_len], rdx
+        test    rdx, rdx
+        jz      .empty               ; legitimate empty glyph (e.g. space)
+
+        call    parse_glyf
+        cmp     eax, 2
+        je      .e_oversize
+
+        ; gvar for outer simple glyph
+        mov     rdi, [glyf_off]
+        call    be_i16
+        test    rax, rax
+        js      .skip_outer_gvar
+        mov     rdi, [glyph_id]
+        xor     rsi, rsi
+        xor     rdx, rdx
+        call    apply_gvar_to_simple
+.skip_outer_gvar:
+
+        call    compute_metrics
+        cmp     qword [img_W], MAX_OUT_DIM
+        ja      .e_oversize
+        cmp     qword [img_H], MAX_OUT_DIM
+        ja      .e_oversize
+
+        ; Tight-bbox transform: pen_x = -xMin*scaleFix, baseline = yMax*scaleFix
+        mov     rax, [out_xMin]
+        neg     rax
+        imul    rax, [img_scaleFix]
+        mov     rdi, rax
+        mov     rax, [out_yMax]
+        imul    rax, [img_scaleFix]
+        mov     rsi, rax
+        call    transform_points
+
+        mov     qword [e_count], 0
+        call    generate_edges
+        cmp     eax, 1
+        je      .e_oversize
+
+        call    clear_big_buffer
+        call    rasterize
+        call    box_filter
+
+        ; metrics for caller
+        mov     rcx, [img_W]
+        mov     rdx, [img_H]
+        ; bearing_x_pixels = round(xMin * arg_size / unitsPerEm)
+        mov     rax, [out_xMin]
+        imul    rax, [arg_size]
+        cqo
+        idiv    qword [head_unitsPerEm]
+        mov     r8, rax
+        ; bearing_y_pixels = round(yMax * arg_size / unitsPerEm)
+        mov     rax, [out_yMax]
+        imul    rax, [arg_size]
+        cqo
+        idiv    qword [head_unitsPerEm]
+        mov     r9, rax
+        ; advance = (hmtx_advance(gid) * arg_size + unitsPerEm/2) / unitsPerEm
+        mov     rdi, [glyph_id]
+        call    hmtx_advance
+        imul    rax, [arg_size]
+        mov     rbx, [head_unitsPerEm]
+        mov     r11, rbx
+        shr     r11, 1
+        add     rax, r11
+        cqo
+        idiv    rbx
+        mov     r10, rax
+
+        xor     eax, eax
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+.empty:
+        ; Empty glyph (space etc.): zero-size bitmap, advance = hmtx
+        mov     qword [img_W], 0
+        mov     qword [img_H], 0
+        xor     rcx, rcx
+        xor     rdx, rdx
+        xor     r8, r8
+        xor     r9, r9
+        mov     rdi, [glyph_id]
+        call    hmtx_advance
+        imul    rax, [arg_size]
+        mov     rbx, [head_unitsPerEm]
+        mov     r11, rbx
+        shr     r11, 1
+        add     rax, r11
+        cqo
+        idiv    rbx
+        mov     r10, rax
+        xor     eax, eax
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+.e_glyph:
+        mov     eax, 1
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.e_oversize:
+        mov     eax, 3
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
 ; ---------------------------------------------------------------------
 ; parse_sfnt: walk the SFNT directory at [font_base] and store offsets
 ;             for the required tables. Returns 0 on OK, 1 on bad sfnt.
@@ -796,6 +990,7 @@ parse_sfnt:
         pop     rbx
         ret
 
+%ifndef GLYPH_LIB
 ; ---------------------------------------------------------------------
 ; dump_tables: print the resolved offsets+lengths to stderr.
 ; Each line: "TAG offset=N length=M"
@@ -923,6 +1118,7 @@ parse_decimal:
         jmp     .l
 .done:
         ret
+%endif  ; !GLYPH_LIB
 
 ; ---------------------------------------------------------------------
 ; Big-endian readers. Each takes a pointer in rdi and returns a value
@@ -2358,6 +2554,7 @@ loca_lookup:
         pop     rbx
         ret
 
+%ifndef GLYPH_LIB
 ; ---------------------------------------------------------------------
 ; dump_parsed — print head/maxp/hhea + resolved glyf to stderr.
 dump_parsed:
@@ -2451,6 +2648,7 @@ dump_parsed:
 
         pop     rbx
         ret
+%endif  ; !GLYPH_LIB
 
 ; ---------------------------------------------------------------------
 ; parse_glyf — TOP-LEVEL entry. Resets accumulators, sets bbox from
@@ -2825,6 +3023,7 @@ parse_composite_into:
         add     rsp, 16
         jmp     .done
 
+%ifndef GLYPH_LIB
 ; ---------------------------------------------------------------------
 ; dump_outline — print numContours/numPoints + bbox.
 dump_outline:
@@ -2882,6 +3081,8 @@ dump_outline:
 
         pop     rbx
         ret
+
+%endif  ; !GLYPH_LIB
 
 ; ---------------------------------------------------------------------
 ; compute_metrics — fills img_W/H, img_bigW/H, img_scaleFix.
@@ -3748,6 +3949,7 @@ box_filter:
         pop     rbx
         ret
 
+%ifndef GLYPH_LIB
 ; ---------------------------------------------------------------------
 ; emit_pgm — write PGM (P5) to stdout: header + raw bytes.
 emit_pgm:
@@ -3902,6 +4104,7 @@ dump_metrics:
         syscall
         pop     rbx
         ret
+%endif  ; !GLYPH_LIB
 
 ; ---------------------------------------------------------------------
 ; utf8_next — decode one UTF-8 codepoint.
@@ -3995,6 +4198,7 @@ hmtx_advance:
         pop     rbx
         ret
 
+%ifndef GLYPH_LIB
 ; ---------------------------------------------------------------------
 ; string_prepass — rdi = pointer to null-terminated ASCII string.
 ; Walks the string. For each byte: cmap_lookup -> glyph_id; record
@@ -4236,3 +4440,4 @@ print_dec_stderr:
         pop     r12
         pop     rbx
         ret
+%endif  ; !GLYPH_LIB
