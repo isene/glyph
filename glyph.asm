@@ -1,0 +1,2609 @@
+; glyph - pure x86_64 asm TTF rasterizer
+; usage: glyph FONT.ttf CODEPOINT SIZE > out.pgm
+; build: nasm -f elf64 glyph.asm -o glyph.o && ld glyph.o -o glyph
+;
+; Phase 1 (this file): skeleton, mmap, SFNT directory dump to stderr.
+; Future phases add cmap/glyf parsing and the rasterizer.
+
+%define SYS_READ        0
+%define SYS_WRITE       1
+%define SYS_OPEN        2
+%define SYS_CLOSE       3
+%define SYS_FSTAT       5
+%define SYS_MMAP        9
+%define SYS_MUNMAP      11
+%define SYS_EXIT        60
+
+%define O_RDONLY        0
+%define PROT_READ       1
+%define MAP_PRIVATE     2
+
+%define STDOUT          1
+%define STDERR          2
+
+%define ST_SIZE_OFF     48      ; struct stat.st_size byte offset
+
+; ---------------------------------------------------------------------
+section .data
+
+usage_msg:      db "usage: glyph FONT.ttf CODEPOINT SIZE", 10
+usage_len       equ $ - usage_msg
+
+err_open:       db "glyph: open failed", 10
+err_open_len    equ $ - err_open
+
+err_fstat:      db "glyph: fstat failed", 10
+err_fstat_len   equ $ - err_fstat
+
+err_mmap:       db "glyph: mmap failed", 10
+err_mmap_len    equ $ - err_mmap
+
+err_sfnt:       db "glyph: not a TTF/SFNT file", 10
+err_sfnt_len    equ $ - err_sfnt
+
+err_table:      db "glyph: required table missing", 10
+err_table_len   equ $ - err_table
+
+err_cmap:       db "glyph: no usable cmap subtable (need format 4)", 10
+err_cmap_len    equ $ - err_cmap
+
+err_glyph:      db "glyph: codepoint not in font", 10
+err_glyph_len   equ $ - err_glyph
+
+err_compos:     db "glyph: composite glyphs not supported in v0", 10
+err_compos_len  equ $ - err_compos
+
+err_too_many:   db "glyph: outline too large for static buffers", 10
+err_too_many_len equ $ - err_too_many
+
+err_too_big:    db "glyph: rasterized image exceeds buffer", 10
+err_too_big_len equ $ - err_too_big
+
+err_edges:      db "glyph: too many edges", 10
+err_edges_len   equ $ - err_edges
+
+pgm_magic:      db "P5", 10
+pgm_magic_len   equ $ - pgm_magic
+
+dump_dim_lbl:   db "image: W="
+dump_dim_lbl_len equ $ - dump_dim_lbl
+dump_h_lbl:     db ", H="
+dump_h_lbl_len  equ $ - dump_h_lbl
+dump_bigw_lbl:  db ", bigW="
+dump_bigw_lbl_len equ $ - dump_bigw_lbl
+dump_bigh_lbl:  db ", bigH="
+dump_bigh_lbl_len equ $ - dump_bigh_lbl
+dump_edges_lbl: db ", edges="
+dump_edges_lbl_len equ $ - dump_edges_lbl
+
+edge_lbl_y:     db ": y["
+edge_lbl_y_len  equ $ - edge_lbl_y
+edge_lbl_x0:    db ") x0="
+edge_lbl_x0_len equ $ - edge_lbl_x0
+edge_lbl_dir:   db " dir="
+edge_lbl_dir_len equ $ - edge_lbl_dir
+
+dump_outline_lbl:  db "outline: numContours="
+dump_outline_lbl_len equ $ - dump_outline_lbl
+dump_npts_lbl:     db ", numPoints="
+dump_npts_lbl_len  equ $ - dump_npts_lbl
+dump_bbox_lbl:     db ", bbox=["
+dump_bbox_lbl_len  equ $ - dump_bbox_lbl
+dump_comma:        db ","
+dump_close:        db "]", 10
+dump_close_len     equ $ - dump_close
+
+dump_head_lbl:  db "head: unitsPerEm="
+dump_head_lbl_len equ $ - dump_head_lbl
+dump_maxp_lbl:  db ", numGlyphs="
+dump_maxp_lbl_len equ $ - dump_maxp_lbl
+dump_hhea_lbl:  db ", ascent="
+dump_hhea_lbl_len equ $ - dump_hhea_lbl
+dump_desc_lbl:  db ", descent="
+dump_desc_lbl_len equ $ - dump_desc_lbl
+dump_lf_lbl:    db ", locFormat="
+dump_lf_lbl_len equ $ - dump_lf_lbl
+
+dump_glyph_lbl: db "glyph_id="
+dump_glyph_lbl_len equ $ - dump_glyph_lbl
+dump_off_lbl:   db ", glyf_off="
+dump_off_lbl_len equ $ - dump_off_lbl
+dump_glen_lbl:  db ", glyf_len="
+dump_glen_lbl_len equ $ - dump_glen_lbl
+
+dump_hdr:       db "SFNT tables:", 10
+dump_hdr_len    equ $ - dump_hdr
+
+space_str:      db " "
+nl_str:         db 10
+
+; required tables (4-char ASCII tags, big-endian on disk so stored as-is)
+tag_head:       db "head"
+tag_maxp:       db "maxp"
+tag_hhea:       db "hhea"
+tag_hmtx:       db "hmtx"
+tag_cmap:       db "cmap"
+tag_loca:       db "loca"
+tag_glyf:       db "glyf"
+
+; ---------------------------------------------------------------------
+section .bss
+
+stat_buf:       resb 144
+
+; argv-derived
+arg_font_path:  resq 1          ; pointer
+arg_codepoint:  resq 1          ; parsed integer
+arg_size:       resq 1          ; parsed integer (pixel size)
+
+; mmap state
+font_fd:        resq 1
+font_base:      resq 1          ; mmap base address
+font_size:      resq 1          ; mmap length
+
+; per-table base+length (offset from font_base, length in bytes)
+tbl_head_off:   resq 1
+tbl_head_len:   resq 1
+tbl_maxp_off:   resq 1
+tbl_maxp_len:   resq 1
+tbl_hhea_off:   resq 1
+tbl_hhea_len:   resq 1
+tbl_hmtx_off:   resq 1
+tbl_hmtx_len:   resq 1
+tbl_cmap_off:   resq 1
+tbl_cmap_len:   resq 1
+tbl_loca_off:   resq 1
+tbl_loca_len:   resq 1
+tbl_glyf_off:   resq 1
+tbl_glyf_len:   resq 1
+
+; small scratch buffers
+hex_buf:        resb 32
+dec_buf:        resb 32
+
+; ---- parsed head ----
+head_unitsPerEm:        resq 1          ; u16, unsigned
+head_locFormat:         resq 1          ; 0 = short, 1 = long
+head_xMin:              resq 1          ; signed
+head_yMin:              resq 1
+head_xMax:              resq 1
+head_yMax:              resq 1
+
+; ---- parsed maxp ----
+maxp_numGlyphs:         resq 1          ; u16
+
+; ---- parsed hhea ----
+hhea_ascent:            resq 1          ; signed
+hhea_descent:           resq 1
+hhea_lineGap:           resq 1
+hhea_numLongMetrics:    resq 1          ; u16
+
+; ---- cmap ----
+cmap_subtable_ptr:      resq 1          ; absolute pointer to chosen format-4 subtable
+cmap_segCount:          resq 1
+cmap_endCode_ptr:       resq 1
+cmap_startCode_ptr:     resq 1
+cmap_idDelta_ptr:       resq 1
+cmap_idRangeOffset_ptr: resq 1
+
+; ---- per-codepoint resolution ----
+glyph_id:               resq 1
+glyf_off:               resq 1          ; absolute file offset of this glyph's glyf entry
+glyf_len:               resq 1          ; bytes (0 = empty glyph)
+
+; ---- parsed outline (simple glyph) ----
+%define MAX_POINTS      2048
+%define MAX_CONTOURS    64
+
+out_numContours:        resq 1
+out_numPoints:          resq 1
+out_xMin:               resq 1
+out_yMin:               resq 1
+out_xMax:               resq 1
+out_yMax:               resq 1
+
+contour_end:            resd MAX_CONTOURS       ; u16-ish, but stored as u32 for simplicity
+pt_x:                   resd MAX_POINTS         ; signed font units
+pt_y:                   resd MAX_POINTS
+pt_flags:               resb MAX_POINTS         ; original TTF flag byte (need only ON_CURVE bit)
+
+; ---- rasterizer state ----
+%define SS              4                       ; supersample factor
+%define MAX_OUT_DIM     512                     ; max output W or H
+%define MAX_BIG_DIM     (MAX_OUT_DIM * SS)
+%define MAX_EDGES       8192
+%define BEZIER_SUBDIV   8                       ; quadratic flatten steps
+%define FLATTEN_TOL     32                      ; recursive Bezier flatness threshold (16.16)
+
+img_W:                  resq 1                  ; output pixel width
+img_H:                  resq 1                  ; output pixel height
+img_bigW:               resq 1                  ; SS*W
+img_bigH:               resq 1                  ; SS*H
+img_scaleFix:           resq 1                  ; (pixelSize * SS * 65536) / unitsPerEm
+
+; transformed (in 16.16 fixed, big-pixel space, Y flipped)
+big_x:                  resd MAX_POINTS
+big_y:                  resd MAX_POINTS
+
+; edge list — five parallel arrays
+e_ymin:                 resd MAX_EDGES          ; integer scanline (inclusive)
+e_ymax:                 resd MAX_EDGES          ; integer scanline (exclusive)
+e_x0:                   resd MAX_EDGES          ; x at top scanline center, 16.16
+e_dx:                   resd MAX_EDGES          ; dx per +1y scanline, 16.16
+e_dir:                  resb MAX_EDGES          ; +1 or -1
+e_count:                resq 1
+
+; supersample buffer (1 byte per big-pixel; 0 or 1)
+big_buffer:             resb (MAX_BIG_DIM * MAX_BIG_DIM)
+
+; output greyscale buffer
+output_buf:             resb (MAX_OUT_DIM * MAX_OUT_DIM)
+
+; PGM header scratch
+pgm_hdr:                resb 64
+
+; ---------------------------------------------------------------------
+section .text
+global _start
+
+_start:
+        mov     rbp, rsp                ; for argv access
+        ; argc at [rbp], argv at [rbp+8 .. ]
+        mov     rax, [rbp]              ; argc
+        cmp     rax, 4
+        jne     .usage
+
+        mov     rdi, [rbp + 16]         ; argv[1] = font path
+        mov     [arg_font_path], rdi
+
+        mov     rdi, [rbp + 24]         ; argv[2] = codepoint (decimal)
+        call    parse_decimal
+        mov     [arg_codepoint], rax
+
+        mov     rdi, [rbp + 32]         ; argv[3] = size
+        call    parse_decimal
+        mov     [arg_size], rax
+
+        ; --- open font ---
+        mov     rax, SYS_OPEN
+        mov     rdi, [arg_font_path]
+        xor     esi, esi                ; O_RDONLY
+        xor     edx, edx
+        syscall
+        test    rax, rax
+        js      .err_open
+        mov     [font_fd], rax
+
+        ; --- fstat for size ---
+        mov     rax, SYS_FSTAT
+        mov     rdi, [font_fd]
+        lea     rsi, [stat_buf]
+        syscall
+        test    rax, rax
+        js      .err_fstat
+
+        mov     rax, [stat_buf + ST_SIZE_OFF]
+        mov     [font_size], rax
+
+        ; --- mmap read-only ---
+        mov     rax, SYS_MMAP
+        xor     edi, edi                ; addr = NULL
+        mov     rsi, [font_size]
+        mov     edx, PROT_READ
+        mov     r10d, MAP_PRIVATE
+        mov     r8, [font_fd]
+        xor     r9d, r9d                ; offset = 0
+        syscall
+        cmp     rax, -4096
+        ja      .err_mmap
+        mov     [font_base], rax
+
+        ; --- close fd (mmap keeps file alive) ---
+        mov     rax, SYS_CLOSE
+        mov     rdi, [font_fd]
+        syscall
+
+        ; --- parse SFNT directory + populate table offsets ---
+        call    parse_sfnt
+        test    rax, rax
+        jnz     .err_sfnt
+
+        ; verify required tables found
+        cmp     qword [tbl_head_off], 0
+        je      .err_table
+        cmp     qword [tbl_maxp_off], 0
+        je      .err_table
+        cmp     qword [tbl_cmap_off], 0
+        je      .err_table
+        cmp     qword [tbl_glyf_off], 0
+        je      .err_table
+        cmp     qword [tbl_loca_off], 0
+        je      .err_table
+
+        ; --- dump tables to stderr ---
+        call    dump_tables
+
+        ; --- parse head, maxp, hhea ---
+        call    parse_head
+        call    parse_maxp
+        call    parse_hhea
+
+        ; --- locate cmap format-4 subtable ---
+        call    find_cmap_format4
+        test    rax, rax
+        jnz     .err_cmap
+
+        ; --- resolve codepoint -> glyph_id -> glyf entry ---
+        mov     rdi, [arg_codepoint]
+        call    cmap_lookup
+        mov     [glyph_id], rax
+        test    rax, rax
+        jz      .err_glyph
+
+        mov     rdi, rax
+        call    loca_lookup
+        mov     [glyf_off], rax
+        mov     [glyf_len], rdx
+
+        call    dump_parsed
+
+        ; --- parse glyf outline ---
+        cmp     qword [glyf_len], 0
+        je      .empty_glyph             ; empty glyph (e.g. space)
+
+        call    parse_glyf
+        cmp     eax, 1
+        je      .err_compos
+        cmp     eax, 2
+        je      .err_too_many
+
+        call    dump_outline
+
+        ; --- compute metrics (W, H, scaleFix) ---
+        call    compute_metrics
+        cmp     qword [img_W], MAX_OUT_DIM
+        ja      .err_too_big
+        cmp     qword [img_H], MAX_OUT_DIM
+        ja      .err_too_big
+
+        ; --- transform points to big-pixel 16.16 ---
+        call    transform_points
+
+        ; --- generate edges from contours ---
+        call    generate_edges
+        cmp     eax, 1
+        je      .err_edges
+
+        call    dump_metrics
+
+        ; --- clear supersample buffer ---
+        call    clear_big_buffer
+
+        ; --- rasterize ---
+        call    rasterize
+
+        ; --- box-filter to output_buf ---
+        call    box_filter
+
+        ; --- emit PGM to stdout ---
+        call    emit_pgm
+
+        xor     edi, edi
+        jmp     .exit
+
+.empty_glyph:
+        ; emit a 1x1 zero PGM so callers see a valid file
+        call    emit_empty_pgm
+        xor     edi, edi
+        jmp     .exit
+
+.usage:
+        mov     edi, STDERR
+        lea     rsi, [usage_msg]
+        mov     edx, usage_len
+        mov     eax, SYS_WRITE
+        syscall
+        mov     edi, 1
+        jmp     .exit
+
+.err_open:
+        lea     rsi, [err_open]
+        mov     edx, err_open_len
+        jmp     .err_print
+
+.err_fstat:
+        lea     rsi, [err_fstat]
+        mov     edx, err_fstat_len
+        jmp     .err_print
+
+.err_mmap:
+        lea     rsi, [err_mmap]
+        mov     edx, err_mmap_len
+        jmp     .err_print
+
+.err_sfnt:
+        lea     rsi, [err_sfnt]
+        mov     edx, err_sfnt_len
+        jmp     .err_print
+
+.err_table:
+        lea     rsi, [err_table]
+        mov     edx, err_table_len
+        jmp     .err_print
+
+.err_cmap:
+        lea     rsi, [err_cmap]
+        mov     edx, err_cmap_len
+        jmp     .err_print
+
+.err_glyph:
+        lea     rsi, [err_glyph]
+        mov     edx, err_glyph_len
+        jmp     .err_print
+
+.err_compos:
+        lea     rsi, [err_compos]
+        mov     edx, err_compos_len
+        jmp     .err_print
+
+.err_too_many:
+        lea     rsi, [err_too_many]
+        mov     edx, err_too_many_len
+        jmp     .err_print
+
+.err_too_big:
+        lea     rsi, [err_too_big]
+        mov     edx, err_too_big_len
+        jmp     .err_print
+
+.err_edges:
+        lea     rsi, [err_edges]
+        mov     edx, err_edges_len
+        jmp     .err_print
+
+.err_print:
+        mov     edi, STDERR
+        mov     eax, SYS_WRITE
+        syscall
+        mov     edi, 1
+
+.exit:
+        mov     eax, SYS_EXIT
+        syscall
+
+; ---------------------------------------------------------------------
+; parse_sfnt: walk the SFNT directory at [font_base] and store offsets
+;             for the required tables. Returns 0 on OK, 1 on bad sfnt.
+;
+; SFNT header layout (12 bytes):
+;   u32  sfntVersion       (0x00010000 for TTF, 'OTTO' for OpenType CFF)
+;   u16  numTables
+;   u16  searchRange
+;   u16  entrySelector
+;   u16  rangeShift
+;
+; Then numTables * 16-byte entries:
+;   u32  tag
+;   u32  checkSum
+;   u32  offset
+;   u32  length
+parse_sfnt:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+
+        mov     r12, [font_base]
+        mov     eax, [r12]
+        bswap   eax
+        cmp     eax, 0x00010000          ; TrueType
+        je      .ok_ver
+        cmp     eax, 0x74727565          ; 'true'
+        je      .ok_ver
+        cmp     eax, 0x4F54544F          ; 'OTTO'
+        je      .ok_ver
+        mov     eax, 1
+        jmp     .ret
+.ok_ver:
+        movzx   r13d, word [r12 + 4]     ; numTables (BE)
+        rol     r13w, 8
+
+        lea     r14, [r12 + 12]
+        xor     ebx, ebx
+.loop:
+        cmp     ebx, r13d
+        jge     .done
+
+        mov     eax, [r14]               ; tag bytes verbatim (disk order)
+        xor     edi, edi                 ; rdi = destination slot ptr (0 = skip)
+
+        cmp     eax, [tag_head]
+        jne     .t1
+        lea     rdi, [tbl_head_off]
+        jmp     .store
+.t1:    cmp     eax, [tag_maxp]
+        jne     .t2
+        lea     rdi, [tbl_maxp_off]
+        jmp     .store
+.t2:    cmp     eax, [tag_hhea]
+        jne     .t3
+        lea     rdi, [tbl_hhea_off]
+        jmp     .store
+.t3:    cmp     eax, [tag_hmtx]
+        jne     .t4
+        lea     rdi, [tbl_hmtx_off]
+        jmp     .store
+.t4:    cmp     eax, [tag_cmap]
+        jne     .t5
+        lea     rdi, [tbl_cmap_off]
+        jmp     .store
+.t5:    cmp     eax, [tag_loca]
+        jne     .t6
+        lea     rdi, [tbl_loca_off]
+        jmp     .store
+.t6:    cmp     eax, [tag_glyf]
+        jne     .next
+        lea     rdi, [tbl_glyf_off]
+
+.store:
+        mov     eax, [r14 + 8]
+        bswap   eax
+        mov     [rdi], rax
+        mov     eax, [r14 + 12]
+        bswap   eax
+        mov     [rdi + 8], rax
+
+.next:
+        add     r14, 16
+        inc     ebx
+        jmp     .loop
+
+.done:
+        xor     eax, eax
+.ret:
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; dump_tables: print the resolved offsets+lengths to stderr.
+; Each line: "TAG offset=N length=M"
+dump_tables:
+        push    rbx
+        push    r12
+
+        mov     edi, STDERR
+        lea     rsi, [dump_hdr]
+        mov     edx, dump_hdr_len
+        mov     eax, SYS_WRITE
+        syscall
+
+        lea     rsi, [tag_head]
+        mov     rdx, [tbl_head_off]
+        mov     rcx, [tbl_head_len]
+        call    dump_one
+
+        lea     rsi, [tag_maxp]
+        mov     rdx, [tbl_maxp_off]
+        mov     rcx, [tbl_maxp_len]
+        call    dump_one
+
+        lea     rsi, [tag_hhea]
+        mov     rdx, [tbl_hhea_off]
+        mov     rcx, [tbl_hhea_len]
+        call    dump_one
+
+        lea     rsi, [tag_hmtx]
+        mov     rdx, [tbl_hmtx_off]
+        mov     rcx, [tbl_hmtx_len]
+        call    dump_one
+
+        lea     rsi, [tag_cmap]
+        mov     rdx, [tbl_cmap_off]
+        mov     rcx, [tbl_cmap_len]
+        call    dump_one
+
+        lea     rsi, [tag_loca]
+        mov     rdx, [tbl_loca_off]
+        mov     rcx, [tbl_loca_len]
+        call    dump_one
+
+        lea     rsi, [tag_glyf]
+        mov     rdx, [tbl_glyf_off]
+        mov     rcx, [tbl_glyf_len]
+        call    dump_one
+
+        pop     r12
+        pop     rbx
+        ret
+
+; rsi = pointer to 4 tag bytes, rdx = offset, rcx = length
+dump_one:
+        push    rbx
+        push    r12
+        push    r13
+        mov     r12, rdx
+        mov     r13, rcx
+
+        ; print "  TAG "
+        mov     edi, STDERR
+        push    rsi
+        mov     eax, SYS_WRITE
+        mov     rsi, rsp
+        ; emit two leading spaces
+        mov     byte [rsp - 8], ' '
+        mov     byte [rsp - 7], ' '
+        lea     rsi, [rsp - 8]
+        mov     edx, 2
+        syscall
+        pop     rsi
+
+        mov     edi, STDERR
+        mov     edx, 4
+        mov     eax, SYS_WRITE
+        syscall
+
+        ; " off=" decimal
+        mov     edi, STDERR
+        lea     rsi, [space_str]
+        mov     edx, 1
+        mov     eax, SYS_WRITE
+        syscall
+
+        mov     rax, r12
+        call    print_dec_stderr
+
+        ; " len=" decimal
+        mov     edi, STDERR
+        lea     rsi, [space_str]
+        mov     edx, 1
+        mov     eax, SYS_WRITE
+        syscall
+
+        mov     rax, r13
+        call    print_dec_stderr
+
+        mov     edi, STDERR
+        lea     rsi, [nl_str]
+        mov     edx, 1
+        mov     eax, SYS_WRITE
+        syscall
+
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; parse_decimal: rdi -> null-terminated decimal string.
+; returns rax = value (no error reporting, junk yields garbage).
+parse_decimal:
+        xor     eax, eax
+.l:
+        movzx   ecx, byte [rdi]
+        test    cl, cl
+        jz      .done
+        sub     ecx, '0'
+        cmp     ecx, 9
+        ja      .done
+        imul    rax, rax, 10
+        add     rax, rcx
+        inc     rdi
+        jmp     .l
+.done:
+        ret
+
+; ---------------------------------------------------------------------
+; Big-endian readers. Each takes a pointer in rdi and returns a value
+; in rax. Caller-saved (no rbx/r12-r15 use).
+
+be_u16:
+        movzx   eax, word [rdi]
+        rol     ax, 8
+        movzx   eax, ax
+        ret
+
+be_i16:
+        movzx   eax, word [rdi]
+        rol     ax, 8
+        movsx   rax, ax
+        ret
+
+be_u32:
+        mov     eax, [rdi]
+        bswap   eax
+        ret
+
+; ---------------------------------------------------------------------
+; parse_head — pull unitsPerEm, indexToLocFormat, bbox.
+; head table layout (relevant fields):
+;   u16 majorVersion (0)
+;   u16 minorVersion (2)
+;   Fixed fontRevision (4)
+;   u32 checkSumAdjustment (8)
+;   u32 magicNumber (12)
+;   u16 flags (16)
+;   u16 unitsPerEm (18)
+;   LONGDATETIME created (20)  8 bytes
+;   LONGDATETIME modified (28) 8 bytes
+;   i16 xMin (36), yMin (38), xMax (40), yMax (42)
+;   u16 macStyle (44)
+;   u16 lowestRecPPEM (46)
+;   i16 fontDirectionHint (48)
+;   i16 indexToLocFormat (50)
+;   i16 glyphDataFormat (52)
+parse_head:
+        mov     rdi, [font_base]
+        add     rdi, [tbl_head_off]
+        push    rdi
+
+        add     rdi, 18
+        call    be_u16
+        mov     [head_unitsPerEm], rax
+
+        mov     rdi, [rsp]
+        add     rdi, 36
+        call    be_i16
+        mov     [head_xMin], rax
+        mov     rdi, [rsp]
+        add     rdi, 38
+        call    be_i16
+        mov     [head_yMin], rax
+        mov     rdi, [rsp]
+        add     rdi, 40
+        call    be_i16
+        mov     [head_xMax], rax
+        mov     rdi, [rsp]
+        add     rdi, 42
+        call    be_i16
+        mov     [head_yMax], rax
+
+        mov     rdi, [rsp]
+        add     rdi, 50
+        call    be_i16
+        mov     [head_locFormat], rax
+        add     rsp, 8
+        ret
+
+; ---------------------------------------------------------------------
+; parse_maxp — numGlyphs at offset 4 (both v0.5 and v1.0 layouts).
+parse_maxp:
+        mov     rdi, [font_base]
+        add     rdi, [tbl_maxp_off]
+        add     rdi, 4
+        call    be_u16
+        mov     [maxp_numGlyphs], rax
+        ret
+
+; ---------------------------------------------------------------------
+; parse_hhea — ascent/descent/lineGap/numberOfHMetrics.
+;   u16 majorVersion (0)
+;   u16 minorVersion (2)
+;   FWORD ascender (4)
+;   FWORD descender (6)
+;   FWORD lineGap (8)
+;   ... (typo, advanceWidthMax, ...)
+;   u16 numberOfHMetrics (34)
+parse_hhea:
+        mov     rdi, [font_base]
+        add     rdi, [tbl_hhea_off]
+        push    rdi
+
+        add     rdi, 4
+        call    be_i16
+        mov     [hhea_ascent], rax
+        mov     rdi, [rsp]
+        add     rdi, 6
+        call    be_i16
+        mov     [hhea_descent], rax
+        mov     rdi, [rsp]
+        add     rdi, 8
+        call    be_i16
+        mov     [hhea_lineGap], rax
+
+        mov     rdi, [rsp]
+        add     rdi, 34
+        call    be_u16
+        mov     [hhea_numLongMetrics], rax
+        add     rsp, 8
+        ret
+
+; ---------------------------------------------------------------------
+; find_cmap_format4 — pick a Unicode cmap subtable in format 4 and
+; populate cmap_subtable_ptr + segment array pointers.
+; Returns 0 on success, 1 if no usable subtable.
+;
+; cmap header (4 bytes):
+;   u16 version
+;   u16 numTables
+; Then numTables * 8-byte encoding records:
+;   u16 platformID
+;   u16 encodingID
+;   u32 subtableOffset (from cmap table base)
+;
+; Preferred subtable platform/encoding for Unicode BMP:
+;   (3, 1)  Microsoft Unicode BMP
+;   (0, *)  Unicode (anything; 0/3 most common for BMP)
+find_cmap_format4:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+
+        mov     r12, [font_base]
+        add     r12, [tbl_cmap_off]      ; r12 = cmap table base
+
+        ; numTables
+        lea     rdi, [r12 + 2]
+        call    be_u16
+        mov     r13, rax                 ; r13 = numTables
+
+        lea     r14, [r12 + 4]           ; r14 = first encoding record
+
+        xor     ebx, ebx
+        xor     r15, r15                 ; will hold chosen subtable abs ptr (0 = none)
+        push    r15                      ; reserve [rsp] = chosen_ptr (avoid using r15 across calls)
+.loop:
+        cmp     ebx, r13d
+        jge     .done
+
+        ; platformID
+        mov     rdi, r14
+        call    be_u16
+        mov     ecx, eax                 ; ecx = platformID
+
+        ; encodingID
+        lea     rdi, [r14 + 2]
+        call    be_u16
+        mov     edx, eax                 ; edx = encodingID
+
+        ; subtableOffset
+        lea     rdi, [r14 + 4]
+        call    be_u32
+        ; rax = offset from cmap base
+        lea     rdi, [r12 + rax]         ; rdi = subtable absolute pointer
+
+        ; check format
+        push    rdi
+        call    be_u16                   ; rax = format
+        pop     rdi
+        cmp     eax, 4
+        jne     .skip
+
+        ; accept (3,1) immediately; (0,*) acceptable as fallback
+        cmp     ecx, 3
+        jne     .try_uni
+        cmp     edx, 1
+        jne     .skip
+        mov     [rsp], rdi
+        jmp     .done                    ; preferred match — stop
+.try_uni:
+        cmp     ecx, 0
+        jne     .skip
+        ; only set if no preferred chosen yet
+        cmp     qword [rsp], 0
+        jne     .skip
+        mov     [rsp], rdi
+.skip:
+        add     r14, 8
+        inc     ebx
+        jmp     .loop
+
+.done:
+        mov     rax, [rsp]
+        add     rsp, 8
+        test    rax, rax
+        jz      .fail
+        mov     [cmap_subtable_ptr], rax
+
+        ; subtable layout (format 4):
+        ;   u16 format (0)
+        ;   u16 length (2)
+        ;   u16 language (4)
+        ;   u16 segCountX2 (6)
+        ;   u16 searchRange (8), entrySelector (10), rangeShift (12)
+        ;   u16 endCode[segCount] (14)
+        ;   u16 reservedPad
+        ;   u16 startCode[segCount]
+        ;   i16 idDelta[segCount]
+        ;   u16 idRangeOffset[segCount]
+        ;   u16 glyphIdArray[]
+        mov     rdi, rax
+        add     rdi, 6
+        push    rax                      ; preserve subtable base
+        call    be_u16                   ; segCountX2
+        shr     eax, 1
+        mov     [cmap_segCount], rax
+        mov     rcx, rax                 ; rcx = segCount
+
+        pop     rax                      ; rax = subtable base
+        lea     rbx, [rax + 14]          ; endCode
+        mov     [cmap_endCode_ptr], rbx
+
+        ; startCode = endCode + segCount*2 + 2 (reservedPad)
+        lea     rbx, [rbx + rcx*2]
+        add     rbx, 2
+        mov     [cmap_startCode_ptr], rbx
+
+        ; idDelta = startCode + segCount*2
+        lea     rbx, [rbx + rcx*2]
+        mov     [cmap_idDelta_ptr], rbx
+
+        ; idRangeOffset = idDelta + segCount*2
+        lea     rbx, [rbx + rcx*2]
+        mov     [cmap_idRangeOffset_ptr], rbx
+
+        xor     eax, eax
+        jmp     .ret
+.fail:
+        mov     eax, 1
+.ret:
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; cmap_lookup — rdi = codepoint, returns rax = glyph_id (0 = .notdef).
+; Linear scan over segments (segCount typically <300, fine for MVP).
+cmap_lookup:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+
+        mov     r12, rdi                 ; r12 = codepoint
+        mov     rcx, [cmap_segCount]
+        mov     r13, rcx                 ; r13 = segCount
+        xor     ebx, ebx                 ; ebx = i
+
+        mov     r14, [cmap_endCode_ptr]
+.find:
+        cmp     ebx, r13d
+        jge     .notdef
+        ; endCode[i]
+        lea     rdi, [r14 + rbx*2]
+        call    be_u16
+        cmp     r12, rax
+        jle     .got_seg
+        inc     ebx
+        jmp     .find
+.got_seg:
+        ; check startCode[i] <= cp
+        mov     rdi, [cmap_startCode_ptr]
+        lea     rdi, [rdi + rbx*2]
+        call    be_u16
+        mov     r15, rax                 ; r15 = startCode[i]
+        cmp     r12, rax
+        jl      .notdef
+
+        ; idRangeOffset[i]
+        mov     rdi, [cmap_idRangeOffset_ptr]
+        lea     r14, [rdi + rbx*2]       ; r14 = address of idRangeOffset[i]
+        mov     rdi, r14
+        call    be_u16
+        test    eax, eax
+        jz      .delta_only
+
+        ; idRangeOffset != 0:
+        ;   glyphAddr = &idRangeOffset[i] + idRangeOffset[i] + 2*(cp - startCode[i])
+        ; Note: idRangeOffset is in BYTES per the OT spec computation
+        ; (its value is bytes from the field's address).
+        mov     rcx, r12
+        sub     rcx, r15                 ; cp - startCode
+        shl     rcx, 1                   ; *2 (u16 entries)
+        add     rcx, rax                 ; + idRangeOffset bytes
+        add     rcx, r14                 ; + addr of idRangeOffset[i]
+        mov     rdi, rcx
+        call    be_u16
+        test    eax, eax
+        jz      .notdef                  ; missing glyph maps to 0
+
+        ; add idDelta (mod 65536)
+        mov     r15d, eax                ; preserve glyph word
+        mov     rdi, [cmap_idDelta_ptr]
+        lea     rdi, [rdi + rbx*2]
+        call    be_i16
+        add     rax, r15
+        and     rax, 0xFFFF
+        jmp     .ret
+
+.delta_only:
+        mov     rdi, [cmap_idDelta_ptr]
+        lea     rdi, [rdi + rbx*2]
+        call    be_i16
+        add     rax, r12
+        and     rax, 0xFFFF
+        jmp     .ret
+
+.notdef:
+        xor     eax, eax
+.ret:
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; loca_lookup — rdi = glyph_id. Returns rax = absolute file offset of
+; the glyph's glyf entry, rdx = byte length (0 = empty glyph).
+loca_lookup:
+        push    rbx
+        push    r12
+        push    r13
+
+        mov     r12, rdi                 ; glyph id
+        mov     rax, [head_locFormat]
+        test    rax, rax
+        jnz     .long_fmt
+
+        ; short loca: u16[] entries, actual offset = entry * 2
+        mov     rdi, [font_base]
+        add     rdi, [tbl_loca_off]
+        lea     rbx, [rdi + r12*2]
+        mov     rdi, rbx
+        call    be_u16
+        mov     r13, rax
+        shl     r13, 1
+        lea     rdi, [rbx + 2]
+        call    be_u16
+        shl     rax, 1
+        sub     rax, r13                 ; rax = length
+        mov     rdx, rax
+        jmp     .compute_off
+
+.long_fmt:
+        mov     rdi, [font_base]
+        add     rdi, [tbl_loca_off]
+        lea     rbx, [rdi + r12*4]
+        mov     rdi, rbx
+        call    be_u32
+        mov     r13, rax
+        lea     rdi, [rbx + 4]
+        call    be_u32
+        sub     rax, r13                 ; rax = length
+        mov     rdx, rax
+
+.compute_off:
+        mov     rax, [font_base]
+        add     rax, [tbl_glyf_off]
+        add     rax, r13
+
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; dump_parsed — print head/maxp/hhea + resolved glyf to stderr.
+dump_parsed:
+        push    rbx
+
+        mov     edi, STDERR
+        lea     rsi, [dump_head_lbl]
+        mov     edx, dump_head_lbl_len
+        mov     eax, SYS_WRITE
+        syscall
+
+        mov     rax, [head_unitsPerEm]
+        call    print_dec_stderr
+
+        mov     edi, STDERR
+        lea     rsi, [dump_maxp_lbl]
+        mov     edx, dump_maxp_lbl_len
+        mov     eax, SYS_WRITE
+        syscall
+
+        mov     rax, [maxp_numGlyphs]
+        call    print_dec_stderr
+
+        mov     edi, STDERR
+        lea     rsi, [dump_hhea_lbl]
+        mov     edx, dump_hhea_lbl_len
+        mov     eax, SYS_WRITE
+        syscall
+
+        mov     rax, [hhea_ascent]
+        call    print_dec_stderr
+
+        mov     edi, STDERR
+        lea     rsi, [dump_desc_lbl]
+        mov     edx, dump_desc_lbl_len
+        mov     eax, SYS_WRITE
+        syscall
+
+        mov     rax, [hhea_descent]
+        call    print_dec_stderr
+
+        mov     edi, STDERR
+        lea     rsi, [dump_lf_lbl]
+        mov     edx, dump_lf_lbl_len
+        mov     eax, SYS_WRITE
+        syscall
+
+        mov     rax, [head_locFormat]
+        call    print_dec_stderr
+
+        mov     edi, STDERR
+        lea     rsi, [nl_str]
+        mov     edx, 1
+        mov     eax, SYS_WRITE
+        syscall
+
+        ; second line: glyph_id, glyf_off, glyf_len
+        mov     edi, STDERR
+        lea     rsi, [dump_glyph_lbl]
+        mov     edx, dump_glyph_lbl_len
+        mov     eax, SYS_WRITE
+        syscall
+
+        mov     rax, [glyph_id]
+        call    print_dec_stderr
+
+        mov     edi, STDERR
+        lea     rsi, [dump_off_lbl]
+        mov     edx, dump_off_lbl_len
+        mov     eax, SYS_WRITE
+        syscall
+
+        mov     rax, [glyf_off]
+        sub     rax, [font_base]         ; show relative for sanity check
+        call    print_dec_stderr
+
+        mov     edi, STDERR
+        lea     rsi, [dump_glen_lbl]
+        mov     edx, dump_glen_lbl_len
+        mov     eax, SYS_WRITE
+        syscall
+
+        mov     rax, [glyf_len]
+        call    print_dec_stderr
+
+        mov     edi, STDERR
+        lea     rsi, [nl_str]
+        mov     edx, 1
+        mov     eax, SYS_WRITE
+        syscall
+
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; parse_glyf — parse the simple glyph at [glyf_off] into BSS arrays.
+; Returns rax = 0 ok, 1 = composite (unsupported), 2 = too large.
+;
+; Glyph header (10 bytes):
+;   i16 numContours    (negative = composite, deferred)
+;   i16 xMin, yMin, xMax, yMax
+;
+; Simple glyph body:
+;   u16 endPtsOfContours[numContours]
+;   u16 instructionLength
+;   u8  instructions[instructionLength]
+;   u8  flags[numPoints]   (with REPEAT bit handling)
+;   u8/u16 xCoords[numPoints]   (delta encoding, sign + size from flags)
+;   u8/u16 yCoords[numPoints]   (same)
+;
+; Flag bits:
+;   0x01 ON_CURVE
+;   0x02 X_SHORT_VECTOR
+;   0x04 Y_SHORT_VECTOR
+;   0x08 REPEAT_FLAG
+;   0x10 X_IS_SAME (or POSITIVE_X_SHORT)
+;   0x20 Y_IS_SAME (or POSITIVE_Y_SHORT)
+parse_glyf:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+
+        mov     r12, [glyf_off]          ; r12 = walking pointer
+
+        ; numContours
+        mov     rdi, r12
+        call    be_i16
+        mov     [out_numContours], rax
+        test    rax, rax
+        js      .composite               ; negative = composite
+
+        cmp     rax, MAX_CONTOURS
+        ja      .toomany
+
+        ; bbox
+        lea     rdi, [r12 + 2]
+        call    be_i16
+        mov     [out_xMin], rax
+        lea     rdi, [r12 + 4]
+        call    be_i16
+        mov     [out_yMin], rax
+        lea     rdi, [r12 + 6]
+        call    be_i16
+        mov     [out_xMax], rax
+        lea     rdi, [r12 + 8]
+        call    be_i16
+        mov     [out_yMax], rax
+
+        add     r12, 10                  ; r12 -> endPtsOfContours[0]
+
+        ; read endPtsOfContours into contour_end[]
+        mov     r13, [out_numContours]   ; r13 = nc
+        xor     ebx, ebx
+.ep_loop:
+        cmp     rbx, r13
+        jge     .ep_done
+        mov     rdi, r12
+        call    be_u16
+        mov     [contour_end + rbx*4], eax
+        add     r12, 2
+        inc     ebx
+        jmp     .ep_loop
+.ep_done:
+        ; numPoints = endPtsOfContours[nc-1] + 1
+        dec     rbx
+        mov     eax, [contour_end + rbx*4]
+        inc     eax
+        mov     [out_numPoints], rax
+        cmp     rax, MAX_POINTS
+        ja      .toomany
+
+        ; skip instructions
+        mov     rdi, r12
+        call    be_u16
+        add     r12, 2
+        add     r12, rax                 ; skip past instructions
+
+        ; ---- decode flags[numPoints] (with REPEAT) ----
+        mov     r13, [out_numPoints]
+        xor     ebx, ebx                 ; ebx = point index
+.fl_loop:
+        cmp     rbx, r13
+        jge     .fl_done
+        movzx   eax, byte [r12]
+        inc     r12
+        mov     [pt_flags + rbx], al
+        inc     rbx
+        test    al, 0x08                 ; REPEAT bit
+        jz      .fl_loop
+        ; next byte is a u8 repeat count
+        movzx   ecx, byte [r12]
+        inc     r12
+.fl_rep:
+        test    ecx, ecx
+        jz      .fl_loop
+        cmp     rbx, r13
+        jge     .fl_done
+        mov     [pt_flags + rbx], al
+        inc     rbx
+        dec     ecx
+        jmp     .fl_rep
+.fl_done:
+
+        ; ---- decode xCoords (delta) ----
+        ; r14 = running absolute x
+        xor     r14, r14
+        xor     ebx, ebx
+.xc_loop:
+        cmp     rbx, r13
+        jge     .xc_done
+        movzx   eax, byte [pt_flags + rbx]
+        ; X_SHORT (bit 1) ?
+        test    al, 0x02
+        jnz     .x_short
+        ; long: if X_IS_SAME (bit 4), delta = 0
+        test    al, 0x10
+        jnz     .x_same
+        ; else 2-byte signed delta
+        mov     rdi, r12
+        call    be_i16
+        add     r14, rax
+        add     r12, 2
+        jmp     .xc_store
+.x_short:
+        movzx   eax, byte [r12]
+        inc     r12
+        ; sign from POSITIVE_X bit (0x10): set => positive, clear => negative
+        movzx   ecx, byte [pt_flags + rbx]
+        test    cl, 0x10
+        jnz     .x_pos
+        neg     eax
+.x_pos:
+        movsx   rax, eax
+        add     r14, rax
+        jmp     .xc_store
+.x_same:
+        ; delta = 0
+.xc_store:
+        mov     [pt_x + rbx*4], r14d
+        inc     rbx
+        jmp     .xc_loop
+.xc_done:
+
+        ; ---- decode yCoords (delta) ----
+        xor     r14, r14
+        xor     ebx, ebx
+.yc_loop:
+        cmp     rbx, r13
+        jge     .yc_done
+        movzx   eax, byte [pt_flags + rbx]
+        test    al, 0x04                 ; Y_SHORT bit 2
+        jnz     .y_short
+        test    al, 0x20                 ; Y_IS_SAME bit 5
+        jnz     .y_same
+        mov     rdi, r12
+        call    be_i16
+        add     r14, rax
+        add     r12, 2
+        jmp     .yc_store
+.y_short:
+        movzx   eax, byte [r12]
+        inc     r12
+        movzx   ecx, byte [pt_flags + rbx]
+        test    cl, 0x20
+        jnz     .y_pos
+        neg     eax
+.y_pos:
+        movsx   rax, eax
+        add     r14, rax
+        jmp     .yc_store
+.y_same:
+.yc_store:
+        mov     [pt_y + rbx*4], r14d
+        inc     rbx
+        jmp     .yc_loop
+.yc_done:
+
+        xor     eax, eax
+        jmp     .ret
+.composite:
+        mov     eax, 1
+        jmp     .ret
+.toomany:
+        mov     eax, 2
+.ret:
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; dump_outline — print numContours/numPoints + bbox.
+dump_outline:
+        push    rbx
+
+        mov     edi, STDERR
+        lea     rsi, [dump_outline_lbl]
+        mov     edx, dump_outline_lbl_len
+        mov     eax, SYS_WRITE
+        syscall
+        mov     rax, [out_numContours]
+        call    print_dec_stderr
+
+        mov     edi, STDERR
+        lea     rsi, [dump_npts_lbl]
+        mov     edx, dump_npts_lbl_len
+        mov     eax, SYS_WRITE
+        syscall
+        mov     rax, [out_numPoints]
+        call    print_dec_stderr
+
+        mov     edi, STDERR
+        lea     rsi, [dump_bbox_lbl]
+        mov     edx, dump_bbox_lbl_len
+        mov     eax, SYS_WRITE
+        syscall
+        mov     rax, [out_xMin]
+        call    print_signed_stderr
+        mov     edi, STDERR
+        lea     rsi, [dump_comma]
+        mov     edx, 1
+        mov     eax, SYS_WRITE
+        syscall
+        mov     rax, [out_yMin]
+        call    print_signed_stderr
+        mov     edi, STDERR
+        lea     rsi, [dump_comma]
+        mov     edx, 1
+        mov     eax, SYS_WRITE
+        syscall
+        mov     rax, [out_xMax]
+        call    print_signed_stderr
+        mov     edi, STDERR
+        lea     rsi, [dump_comma]
+        mov     edx, 1
+        mov     eax, SYS_WRITE
+        syscall
+        mov     rax, [out_yMax]
+        call    print_signed_stderr
+        mov     edi, STDERR
+        lea     rsi, [dump_close]
+        mov     edx, dump_close_len
+        mov     eax, SYS_WRITE
+        syscall
+
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; compute_metrics — fills img_W/H, img_bigW/H, img_scaleFix.
+;
+; pixelSize = arg_size
+; scale     = pixelSize / unitsPerEm
+; W = ceil((xMax - xMin) * scale)
+; H = ceil((yMax - yMin) * scale)
+; scaleFix  = (pixelSize * SS * 65536) / unitsPerEm   (16.16 fixed)
+compute_metrics:
+        ; W = ((xMax - xMin) * pixelSize + unitsPerEm - 1) / unitsPerEm
+        mov     rax, [out_xMax]
+        sub     rax, [out_xMin]
+        mov     rcx, [arg_size]
+        imul    rax, rcx
+        mov     rcx, [head_unitsPerEm]
+        add     rax, rcx
+        dec     rax
+        xor     edx, edx
+        div     rcx
+        mov     [img_W], rax
+
+        mov     rax, [out_yMax]
+        sub     rax, [out_yMin]
+        mov     rcx, [arg_size]
+        imul    rax, rcx
+        mov     rcx, [head_unitsPerEm]
+        add     rax, rcx
+        dec     rax
+        xor     edx, edx
+        div     rcx
+        mov     [img_H], rax
+
+        mov     rax, [img_W]
+        shl     rax, 2                  ; * SS (=4)
+        mov     [img_bigW], rax
+        mov     rax, [img_H]
+        shl     rax, 2
+        mov     [img_bigH], rax
+
+        ; scaleFix = (arg_size * SS * 65536) / unitsPerEm
+        mov     rax, [arg_size]
+        shl     rax, 2                  ; * SS
+        shl     rax, 16                 ; * 65536
+        xor     edx, edx
+        div     qword [head_unitsPerEm]
+        mov     [img_scaleFix], rax
+        ret
+
+; ---------------------------------------------------------------------
+; transform_points — pt_x[i],pt_y[i] (font units) -> big_x[i],big_y[i]
+; in 16.16 fixed-point, big-pixel coordinate space (Y flipped).
+;
+;   big_x = (fx - xMin) * scaleFix
+;   big_y = (yMax - fy) * scaleFix
+transform_points:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+
+        mov     r13, [out_xMin]
+        mov     r14, [out_yMax]
+        mov     r12, [img_scaleFix]
+
+        mov     rcx, [out_numPoints]
+        xor     ebx, ebx
+.loop:
+        cmp     rbx, rcx
+        jge     .done
+
+        movsxd  rax, dword [pt_x + rbx*4]
+        sub     rax, r13
+        imul    rax, r12
+        mov     [big_x + rbx*4], eax
+
+        movsxd  rax, dword [pt_y + rbx*4]
+        mov     rdx, r14
+        sub     rdx, rax
+        mov     rax, rdx
+        imul    rax, r12
+        mov     [big_y + rbx*4], eax
+
+        inc     rbx
+        jmp     .loop
+.done:
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; clear_big_buffer — zero img_bigW * img_bigH bytes of big_buffer
+; (only the active region; full BSS is already zeroed at start).
+clear_big_buffer:
+        push    rbx
+        mov     rax, [img_bigW]
+        mov     rcx, [img_bigH]
+        imul    rax, rcx
+        mov     rcx, rax                 ; bytes
+        lea     rdi, [big_buffer]
+        xor     eax, eax
+        rep     stosb
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; emit_line — line segment from (x0,y0) to (x1,y1), all 16.16.
+; Generates edges into e_*[].
+;   args:  esi = x0, edi = y0, edx = x1, ecx = y1   (32-bit each, signed)
+; Skips horizontal segments. ymin/ymax become integer scanline indices.
+emit_line:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        push    rbp
+
+        mov     r12d, esi               ; x0
+        mov     r13d, edi               ; y0
+        mov     r14d, edx               ; x1
+        mov     r15d, ecx               ; y1
+
+        ; If y0 == y1: horizontal, skip.
+        cmp     r13d, r15d
+        je      .done
+
+        ; Determine ymin, ymax in fixed; winding +1 if y1>y0 (downward), else -1.
+        cmp     r13d, r15d
+        jl      .down
+        ; y1 < y0: upward edge, winding = -1
+        mov     ebp, -1
+        ; swap so (x0,y0) is the top: top=(x1,y1), bottom=(x0,y0)
+        xchg    r12d, r14d
+        xchg    r13d, r15d
+        jmp     .have_dir
+.down:
+        mov     ebp, 1
+.have_dir:
+        ; Now r13d = y_top (16.16, smaller), r15d = y_bot (16.16)
+        ;     r12d = x at top, r14d = x at bottom
+
+        ; integer scanline range: ymin = floor(y_top + 0.5), ymax = floor(y_bot + 0.5)
+        ; (we sample at y+0.5 for each integer scanline y, so we want scanlines
+        ;  where y+0.5 is in [y_top, y_bot)).
+        mov     eax, r13d
+        add     eax, 0x8000              ; +0.5
+        sar     eax, 16                  ; floor
+        mov     ebx, eax                 ; ebx = ymin
+
+        mov     eax, r15d
+        add     eax, 0x8000
+        sar     eax, 16
+        mov     edi, eax                 ; edi = ymax (exclusive)
+
+        cmp     ebx, edi
+        jge     .done                    ; no scanline crosses
+
+        ; clamp to [0, bigH)
+        mov     ecx, dword [img_bigH]
+        test    ebx, ebx
+        jns     .clamp_top_done
+        xor     ebx, ebx
+.clamp_top_done:
+        cmp     edi, ecx
+        jle     .clamp_bot_done
+        mov     edi, ecx
+.clamp_bot_done:
+        cmp     ebx, edi
+        jge     .done
+
+        ; slope dx/dy in 16.16 = (x_bot - x_top) * 65536 / (y_bot - y_top)
+        ; both in 16.16, so dy = (y_bot - y_top) is 16.16; dx_input = x_bot - x_top is 16.16.
+        ; result = (dx_input << 16) / dy.
+        mov     eax, r14d
+        sub     eax, r12d                ; dx 16.16 (signed)
+        movsxd  rax, eax
+        shl     rax, 16
+        mov     ecx, r15d
+        sub     ecx, r13d                ; dy 16.16 (positive)
+        movsxd  rcx, ecx
+        cqo
+        idiv    rcx                      ; rax = dx per 1.0-y step (16.16)
+        mov     r9d, eax                 ; r9d = dx_per_dy
+
+        ; x_at_top_scanline_center = x_top + dx_per_dy * (ymin + 0.5 - y_top_in_units_of_y)
+        ; In 16.16: ymin*65536 + 0x8000 - y_top  (all 16.16)
+        mov     eax, ebx                 ; ymin
+        shl     eax, 16
+        add     eax, 0x8000
+        sub     eax, r13d                ; (ymin+0.5)*65536 - y_top   (16.16 delta-y)
+        movsxd  rax, eax
+        movsxd  r10, r9d
+        imul    rax, r10
+        sar     rax, 16                  ; multiply two 16.16 -> 16.16: shift back
+        add     eax, r12d                ; + x_top
+        mov     r10d, eax                ; x at first scanline
+
+        ; store edge
+        mov     rax, [e_count]
+        cmp     rax, MAX_EDGES
+        jge     .overflow
+        mov     [e_ymin + rax*4], ebx
+        mov     [e_ymax + rax*4], edi
+        mov     [e_x0   + rax*4], r10d
+        mov     [e_dx   + rax*4], r9d
+        mov     [e_dir  + rax], bpl
+        inc     rax
+        mov     [e_count], rax
+.done:
+        pop     rbp
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.overflow:
+        ; silently drop further edges; caller can detect via e_count==MAX_EDGES
+        jmp     .done
+
+; ---------------------------------------------------------------------
+; emit_quad — quadratic Bezier from (x0,y0) via control (cx,cy) to
+; (x1,y1). All inputs 32-bit 16.16. Uses fixed N-step subdivision.
+;
+; Stack args layout (caller pushes in reverse):
+;   [rsp+8]  = x0
+;   [rsp+16] = y0
+;   [rsp+24] = cx
+;   [rsp+32] = cy
+;   [rsp+40] = x1
+;   [rsp+48] = y1
+; Each stored as full 64-bit (sign-extended 32-bit value).
+emit_quad:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        push    rbp
+
+        ; load args (after 6 pushes, [rsp+56] is return addr)
+        mov     r12, [rsp + 64]          ; x0
+        mov     r13, [rsp + 72]          ; y0
+        mov     r14, [rsp + 80]          ; cx
+        mov     r15, [rsp + 88]          ; cy
+        mov     rbx, [rsp + 96]          ; x1
+        mov     rbp, [rsp + 104]         ; y1
+
+        ; subdivide into BEZIER_SUBDIV segments
+        ; B(t) = (1-t)^2 P0 + 2t(1-t) C + t^2 P1
+        ; Use t = i/N for i = 0..N
+        mov     rcx, BEZIER_SUBDIV       ; counter (we generate N segments)
+        ; previous point starts at (P0)
+        mov     r8, r12                  ; prev_x
+        mov     r9, r13                  ; prev_y
+        mov     r10, 1                   ; i = 1
+.q_loop:
+        ; t = i / N (we keep i in r10, compute scaled below)
+        ; To avoid floating point: compute coefficients * 65536:
+        ;   t_num = i, t_den = N
+        ;   one_minus_t_num = N - i
+        ;   weights:
+        ;     w0 = (N-i)^2 / N^2
+        ;     w1 = 2*i*(N-i) / N^2
+        ;     w2 = i^2 / N^2
+        ;   Each scaled by 65536 to keep precision.
+        ;     w0_q = (N-i)^2 * 65536 / N^2
+        mov     r11, BEZIER_SUBDIV
+        sub     r11, r10                 ; r11 = N - i
+        mov     rax, r11
+        imul    rax, r11                 ; (N-i)^2
+        shl     rax, 16
+        mov     rdx, BEZIER_SUBDIV * BEZIER_SUBDIV
+        xor     edx, edx
+        mov     rsi, BEZIER_SUBDIV * BEZIER_SUBDIV
+        div     rsi
+        mov     rdi, rax                 ; rdi = w0_q
+
+        mov     rax, r10
+        imul    rax, r11                 ; i*(N-i)
+        shl     rax, 17                  ; *2*65536
+        xor     edx, edx
+        mov     rsi, BEZIER_SUBDIV * BEZIER_SUBDIV
+        div     rsi
+        mov     rsi, rax                 ; rsi = w1_q
+
+        mov     rax, r10
+        imul    rax, r10                 ; i^2
+        shl     rax, 16
+        xor     edx, edx
+        mov     r11, BEZIER_SUBDIV * BEZIER_SUBDIV
+        div     r11
+        ; rax = w2_q
+
+        ; px = (w0 * P0.x + w1 * C.x + w2 * P1.x) / 65536
+        ; All weights are .16 fixed; coords are 16.16.
+        ; Output is also 16.16 (because (.16 * 16.16) = 32.16 which then >> 16 leaves .16... wait)
+        ;
+        ; Actually: weights are 16.16 fixed (range 0..65536).
+        ;   coord is 16.16 fixed (range integer .. 16-bit fractional)
+        ;   product is 32.32, then shift right 16 to get 16.16.
+        ; But weight is only ".16" (0..1.0 fixed), so:
+        ;   weight * coord = (fraction.16) * (int16.16) = (32-bit int .* 32-bit int) = 64-bit
+        ;   we want the result as 16.16 = (weight * coord) >> 16.
+        push    rax                      ; save w2_q
+        push    rsi                      ; save w1_q
+        push    rdi                      ; save w0_q
+
+        ; px contribution
+        movsxd  rax, r12d                ; P0.x (sign-extended)
+        imul    rax, qword [rsp]         ; * w0_q
+        sar     rax, 16
+        movsxd  rdx, r14d                ; C.x
+        imul    rdx, qword [rsp + 8]     ; * w1_q
+        sar     rdx, 16
+        add     rax, rdx
+        movsxd  rdx, ebx                 ; P1.x
+        imul    rdx, qword [rsp + 16]    ; * w2_q
+        sar     rdx, 16
+        add     rax, rdx
+        ; rax = new px (16.16)
+        push    rax                      ; save px
+
+        ; py contribution
+        movsxd  rax, r13d                ; P0.y
+        imul    rax, qword [rsp + 8]     ; w0_q (now at +8 due to extra push)
+        sar     rax, 16
+        movsxd  rdx, r15d                ; C.y
+        imul    rdx, qword [rsp + 16]    ; w1_q
+        sar     rdx, 16
+        add     rax, rdx
+        movsxd  rdx, ebp                 ; P1.y
+        imul    rdx, qword [rsp + 24]    ; w2_q
+        sar     rdx, 16
+        add     rax, rdx
+        ; rax = new py
+        mov     r11, rax
+        pop     rax                      ; restore px to rax
+        ; emit_line(prev, new) — emit_line takes (x0=esi, y0=edi, x1=edx, y1=ecx)
+        push    rax                      ; px back on stack
+        mov     esi, r8d                 ; prev_x
+        mov     edi, r9d                 ; prev_y
+        mov     edx, eax                 ; new px (truncated to 32-bit)
+        mov     ecx, r11d                ; new py (truncated)
+        push    r10
+        push    r11
+        push    rcx
+        call    emit_line
+        pop     rcx
+        pop     r11
+        pop     r10
+        pop     rax                      ; px
+
+        mov     r8, rax                  ; prev = new
+        mov     r9, r11
+
+        add     rsp, 24                  ; drop saved w0/w1/w2
+
+        inc     r10
+        cmp     r10, BEZIER_SUBDIV
+        jle     .q_loop
+
+        pop     rbp
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; generate_edges — walk all contours, expanding off-curve points into
+; quadratic Beziers (then flattened) and on-on into line segments.
+; Returns 0 ok, 1 if too many edges (already capped by emit_line).
+;
+; Algorithm per contour:
+;   - Find a starting "pen" position:
+;       * if pts[start].on    : pen = pts[start]
+;       * elif pts[end].on    : pen = pts[end] ; walk pts[start..end-1]
+;       * else                : pen = midpoint(pts[end], pts[start])
+;   - Walk through points (in cyclic order), track pending_off control.
+;   - Close back to starting pen with a final line or quadratic.
+generate_edges:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        push    rbp
+
+        mov     qword [e_count], 0
+
+        mov     r15, [out_numContours]
+        test    r15, r15
+        jz      .all_done
+        xor     r12, r12                 ; r12 = contour index
+        xor     r13, r13                 ; r13 = first point index of current contour
+.c_loop:
+        cmp     r12, r15
+        jge     .all_done
+        ; r14 = end point index of contour (inclusive)
+        mov     r14d, [contour_end + r12*4]
+        ; n = r14 - r13 + 1 ; if n < 2, skip
+        mov     rax, r14
+        sub     rax, r13
+        cmp     rax, 1
+        jl      .c_next
+
+        ; render contour from index r13..r14
+        sub     rsp, 64                  ; scratch: sx, sy, px, py, pox, poy, has_pending, start_idx_offset
+        mov     qword [rsp + 48], 0      ; has_pending = 0
+
+        ; Determine starting (sx,sy) and walk start
+        ; Look at flags of points[r13] and points[r14]:
+        movzx   eax, byte [pt_flags + r13]
+        test    al, 1
+        jz      .start_first_off
+
+        ; start = pts[r13] (first is on); walk i from r13+1 to r14
+        mov     ecx, [big_x + r13*4]
+        mov     [rsp +  0], rcx          ; sx
+        mov     ecx, [big_y + r13*4]
+        mov     [rsp +  8], rcx          ; sy
+        mov     ecx, [big_x + r13*4]
+        mov     [rsp + 16], rcx          ; px = sx
+        mov     ecx, [big_y + r13*4]
+        mov     [rsp + 24], rcx          ; py = sy
+        mov     rax, r13
+        inc     rax
+        mov     [rsp + 56], rax          ; walk_i
+        jmp     .walk
+
+.start_first_off:
+        movzx   eax, byte [pt_flags + r14]
+        test    al, 1
+        jz      .start_both_off
+        ; first off, last on: start = pts[r14]; walk r13..r14-1
+        mov     ecx, [big_x + r14*4]
+        mov     [rsp +  0], rcx
+        mov     ecx, [big_y + r14*4]
+        mov     [rsp +  8], rcx
+        mov     ecx, [big_x + r14*4]
+        mov     [rsp + 16], rcx          ; px = sx
+        mov     ecx, [big_y + r14*4]
+        mov     [rsp + 24], rcx
+        mov     rax, r13
+        mov     [rsp + 56], rax
+        ; walk-end: r14-1 (we'll handle by limiting in loop)
+        ; Easiest: temporarily set r14 = r14 - 1 for this contour.
+        dec     r14
+        jmp     .walk
+
+.start_both_off:
+        ; both ends off: pen = midpoint(pts[r14], pts[r13])
+        mov     eax, [big_x + r14*4]
+        add     eax, [big_x + r13*4]
+        sar     eax, 1
+        mov     [rsp +  0], rax
+        mov     [rsp + 16], rax
+        mov     eax, [big_y + r14*4]
+        add     eax, [big_y + r13*4]
+        sar     eax, 1
+        mov     [rsp +  8], rax
+        mov     [rsp + 24], rax
+        mov     rax, r13
+        mov     [rsp + 56], rax
+
+.walk:
+        mov     rbx, [rsp + 56]
+.w_loop:
+        cmp     rbx, r14
+        jg      .w_close
+        movzx   eax, byte [pt_flags + rbx]
+        test    al, 1
+        jz      .pt_off
+
+        ; ON point
+        cmp     qword [rsp + 48], 0
+        jne     .on_with_pending
+        ; emit line from (px,py) -> (pts[rbx])
+        mov     esi, [rsp + 16]          ; px
+        mov     edi, [rsp + 24]          ; py
+        mov     edx, [big_x + rbx*4]
+        mov     ecx, [big_y + rbx*4]
+        push    rbx
+        call    emit_line
+        pop     rbx
+        mov     ecx, [big_x + rbx*4]
+        mov     [rsp + 16], rcx          ; px = new
+        mov     ecx, [big_y + rbx*4]
+        mov     [rsp + 24], rcx          ; py = new
+        jmp     .w_advance
+.on_with_pending:
+        ; emit_quad(prev_pen, pending_off, new_on)
+        ; push args in reverse (right-to-left): y1, x1, cy, cx, y0, x0
+        ; emit_quad expects 64-bit args (sign-extended)
+        movsxd  rax, dword [big_y + rbx*4]
+        push    rax
+        movsxd  rax, dword [big_x + rbx*4]
+        push    rax
+        movsxd  rax, dword [rsp + 32 + 24]   ; poy (rsp moved by 16)
+        push    rax
+        movsxd  rax, dword [rsp + 32 + 24]   ; pox  (now rsp moved by 24)
+        push    rax
+        movsxd  rax, dword [rsp + 32 + 24]   ; py
+        push    rax
+        movsxd  rax, dword [rsp + 32 + 24]   ; px
+        push    rax
+        push    rbx
+        call    emit_quad
+        pop     rbx
+        add     rsp, 48
+        ; px = pts[rbx]
+        mov     ecx, [big_x + rbx*4]
+        mov     [rsp + 16], rcx
+        mov     ecx, [big_y + rbx*4]
+        mov     [rsp + 24], rcx
+        mov     qword [rsp + 48], 0      ; clear pending
+        jmp     .w_advance
+
+.pt_off:
+        ; OFF point
+        cmp     qword [rsp + 48], 0
+        jne     .off_with_pending
+        ; first off: store as pending
+        mov     eax, [big_x + rbx*4]
+        mov     [rsp + 32], rax          ; pox
+        mov     eax, [big_y + rbx*4]
+        mov     [rsp + 40], rax          ; poy
+        mov     qword [rsp + 48], 1
+        jmp     .w_advance
+
+.off_with_pending:
+        ; implicit on at midpoint(pending, current_off)
+        ; emit_quad(pen, pending, midpoint), then pending = current
+        mov     eax, [rsp + 32]          ; pox
+        add     eax, [big_x + rbx*4]
+        sar     eax, 1
+        mov     r10d, eax                ; mx
+        mov     eax, [rsp + 40]
+        add     eax, [big_y + rbx*4]
+        sar     eax, 1
+        mov     r11d, eax                ; my
+        ; Save r10/r11 BEFORE arg pushes so they don't disturb emit_quad's
+        ; expected stack-arg offsets (+64..+104).
+        push    r11
+        push    r10
+        ; emit_quad args (right-to-left): y1=my, x1=mx, cy=poy, cx=pox, y0=py, x0=px
+        ; Local frame is now 16 bytes deeper because of r11/r10 pushes, so
+        ; the [rsp + 32 + 24] = +56 trick still walks the frame correctly:
+        ; after 2 (r11,r10) + N pushes, [rsp + 56 + 16] reads slot at original
+        ; offset (40 - 8N) — exactly the same pattern as on_with_pending.
+        movsxd  rax, r11d                ; my
+        push    rax
+        movsxd  rax, r10d                ; mx
+        push    rax
+        movsxd  rax, dword [rsp + 56 + 16]   ; poy (rsp deeper by 16 + 16)
+        push    rax
+        movsxd  rax, dword [rsp + 56 + 16]
+        push    rax
+        movsxd  rax, dword [rsp + 56 + 16]
+        push    rax
+        movsxd  rax, dword [rsp + 56 + 16]
+        push    rax
+        push    rbx
+        call    emit_quad
+        pop     rbx
+        add     rsp, 48
+        pop     r10
+        pop     r11
+        ; pen = midpoint
+        mov     [rsp + 16], r10d
+        mov     [rsp + 24], r11d
+        ; pending = current off
+        mov     eax, [big_x + rbx*4]
+        mov     [rsp + 32], rax
+        mov     eax, [big_y + rbx*4]
+        mov     [rsp + 40], rax
+
+.w_advance:
+        inc     rbx
+        jmp     .w_loop
+
+.w_close:
+        ; close back to (sx,sy)
+        cmp     qword [rsp + 48], 0
+        jne     .close_quad
+        ; line from (px,py) to (sx,sy)
+        mov     esi, [rsp + 16]
+        mov     edi, [rsp + 24]
+        mov     edx, [rsp +  0]
+        mov     ecx, [rsp +  8]
+        call    emit_line
+        jmp     .c_done
+.close_quad:
+        ; quad from (px,py) via (pox,poy) to (sx,sy)
+        ; Pushes (right-to-left): sy, sx, poy, pox, py, px.
+        ; After 2 pushes the local frame slot N is at [rsp + N + 16]; we use
+        ; the trick of always reading [rsp + 56] which walks the next-deeper
+        ; slot as each push happens.
+        movsxd  rax, dword [rsp +  8]    ; sy
+        push    rax
+        movsxd  rax, dword [rsp +  8]    ; sx (after 1 push, sx is at [rsp+8])
+        push    rax
+        movsxd  rax, dword [rsp + 56]    ; poy
+        push    rax
+        movsxd  rax, dword [rsp + 56]    ; pox
+        push    rax
+        movsxd  rax, dword [rsp + 56]    ; py
+        push    rax
+        movsxd  rax, dword [rsp + 56]    ; px
+        push    rax
+        push    rbx                      ; padding push so emit_quad's stack arg offsets line up
+        call    emit_quad
+        pop     rbx
+        add     rsp, 48
+.c_done:
+        add     rsp, 64
+
+.c_next:
+        ; restore r14 if we decremented (start_first_off + last_on case): we need
+        ; to reset r13 = old_r14 + 1 = (current_r14_after_dec + 1) if dec'd, else
+        ; r13 = current_r14 + 1. Either way r13 = original_end + 1, so just read
+        ; contour_end again.
+        mov     r14d, [contour_end + r12*4]
+        mov     r13, r14
+        inc     r13
+        inc     r12
+        jmp     .c_loop
+.all_done:
+        xor     eax, eax
+        cmp     qword [e_count], MAX_EDGES
+        jne     .ret
+        mov     eax, 1
+.ret:
+        pop     rbp
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; rasterize — for each scanline 0..bigH-1, scan all edges, find x
+; intersections at y+0.5, sort, then NZW-fill spans into big_buffer.
+; Uses a small static buffer for per-scanline (x, dir) pairs.
+;
+; xs_buf: i32[MAX_INTS]  (x in 16.16)
+; ds_buf: i8[MAX_INTS]   (winding dir)
+section .bss
+%define MAX_INTS_PER_SCAN  256
+xs_buf:                 resd MAX_INTS_PER_SCAN
+ds_buf:                 resb MAX_INTS_PER_SCAN
+section .text
+
+rasterize:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+
+        xor     r12, r12                 ; y = 0
+        mov     r13, [img_bigH]
+.y_loop:
+        cmp     r12, r13
+        jge     .y_done
+
+        ; collect intersections for scanline y
+        xor     r14, r14                 ; intersection count
+        xor     rbx, rbx                 ; edge index
+        mov     r15, [e_count]
+.e_loop:
+        cmp     rbx, r15
+        jge     .e_done
+        mov     ecx, [e_ymin + rbx*4]    ; ymin (int)
+        cmp     r12d, ecx
+        jl      .e_skip
+        mov     ecx, [e_ymax + rbx*4]
+        cmp     r12d, ecx
+        jge     .e_skip
+        ; x = e_x0 + (y - e_ymin) * e_dx
+        mov     eax, r12d
+        sub     eax, [e_ymin + rbx*4]    ; (y - ymin) integer
+        movsxd  rax, eax
+        movsxd  rcx, dword [e_dx + rbx*4]
+        imul    rax, rcx                 ; (y - ymin) * dx (16.16)
+        movsxd  rcx, dword [e_x0 + rbx*4]
+        add     rax, rcx                 ; x in 16.16
+        cmp     r14, MAX_INTS_PER_SCAN
+        jge     .e_skip
+        mov     [xs_buf + r14*4], eax
+        movsx   ecx, byte [e_dir + rbx]
+        mov     [ds_buf + r14], cl
+        inc     r14
+.e_skip:
+        inc     rbx
+        jmp     .e_loop
+.e_done:
+        ; sort by x (insertion sort, parallel arrays)
+        mov     rcx, 1
+.s_outer:
+        cmp     rcx, r14
+        jge     .s_done
+        mov     eax, [xs_buf + rcx*4]
+        movzx   esi, byte [ds_buf + rcx]
+        mov     rdx, rcx
+.s_inner:
+        test    rdx, rdx
+        jz      .s_place
+        mov     edi, [xs_buf + rdx*4 - 4]
+        cmp     edi, eax
+        jle     .s_place
+        mov     [xs_buf + rdx*4], edi
+        movzx   edi, byte [ds_buf + rdx - 1]
+        mov     [ds_buf + rdx], dil
+        dec     rdx
+        jmp     .s_inner
+.s_place:
+        mov     [xs_buf + rdx*4], eax
+        mov     [ds_buf + rdx], sil
+        inc     rcx
+        jmp     .s_outer
+.s_done:
+
+        ; NZW fill
+        xor     rcx, rcx                 ; intersection iterator
+        xor     r10d, r10d               ; winding sum (in r10 — rdi gets clobbered by stosb)
+        xor     ebp, ebp                 ; prev_x int (only valid when inside)
+.f_loop:
+        cmp     rcx, r14
+        jge     .f_eos
+        ; current intersection x_int = (xs[i] + 0x8000) >> 16  (round to nearest)
+        mov     eax, [xs_buf + rcx*4]
+        add     eax, 0x8000
+        sar     eax, 16
+        ; clamp to [0, bigW]
+        cmp     eax, 0
+        jge     .clamp_lo
+        xor     eax, eax
+.clamp_lo:
+        cmp     eax, dword [img_bigW]
+        jle     .clamp_hi
+        mov     eax, dword [img_bigW]
+.clamp_hi:
+        mov     ebx, eax                 ; ebx = x_int
+
+        test    r10d, r10d
+        jz      .skip_fill
+        ; fill big_buffer[y*bigW + prev_x .. x_int)
+        mov     rax, r12
+        imul    rax, [img_bigW]
+        lea     rsi, [big_buffer]
+        add     rsi, rax
+        movsxd  rax, ebp
+        add     rsi, rax
+        mov     edx, ebx
+        sub     edx, ebp
+        jle     .skip_fill
+        push    rcx
+        mov     ecx, edx
+        mov     al, 1
+        mov     rdi, rsi
+        rep     stosb
+        pop     rcx
+.skip_fill:
+        movsx   eax, byte [ds_buf + rcx]
+        add     r10d, eax
+        mov     ebp, ebx
+        inc     rcx
+        jmp     .f_loop
+.f_eos:
+
+        inc     r12
+        jmp     .y_loop
+.y_done:
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; box_filter — average each SS x SS block of big_buffer to one byte
+; in output_buf.  output[oy*W + ox] = sum * 255 / (SS*SS)
+box_filter:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        push    rbp
+
+        mov     r12, [img_W]
+        mov     r13, [img_H]
+        mov     r14, [img_bigW]
+
+        xor     r15, r15                 ; oy
+.oy_loop:
+        cmp     r15, r13
+        jge     .done
+        xor     rbx, rbx                 ; ox
+.ox_loop:
+        cmp     rbx, r12
+        jge     .ox_done
+        xor     edi, edi                 ; sum
+        xor     rcx, rcx                 ; sy
+.sy_loop:
+        cmp     rcx, SS
+        jge     .sy_done
+        mov     rax, r15
+        imul    rax, SS
+        add     rax, rcx                 ; by = oy*SS + sy
+        imul    rax, r14                 ; *bigW
+        mov     rdx, rbx
+        imul    rdx, SS                  ; bx = ox*SS
+        add     rax, rdx
+        lea     rsi, [big_buffer]
+        add     rsi, rax
+        ; sum 4 bytes
+        movzx   ebp, byte [rsi]
+        add     edi, ebp
+        movzx   ebp, byte [rsi + 1]
+        add     edi, ebp
+        movzx   ebp, byte [rsi + 2]
+        add     edi, ebp
+        movzx   ebp, byte [rsi + 3]
+        add     edi, ebp
+        inc     rcx
+        jmp     .sy_loop
+.sy_done:
+        ; alpha = sum * 255 / 16
+        mov     eax, edi
+        imul    eax, 255
+        shr     eax, 4                   ; /16 (SS*SS)
+        ; store
+        mov     rdx, r15
+        imul    rdx, r12
+        add     rdx, rbx
+        lea     rsi, [output_buf]
+        mov     [rsi + rdx], al
+        inc     rbx
+        jmp     .ox_loop
+.ox_done:
+        inc     r15
+        jmp     .oy_loop
+.done:
+        pop     rbp
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; emit_pgm — write PGM (P5) to stdout: header + raw bytes.
+emit_pgm:
+        ; header: "P5\nW H\n255\n"
+        lea     rdi, [pgm_hdr]
+        mov     byte [rdi], 'P'
+        mov     byte [rdi+1], '5'
+        mov     byte [rdi+2], 10
+        add     rdi, 3
+        mov     rax, [img_W]
+        call    itoa
+        mov     byte [rdi], ' '
+        inc     rdi
+        mov     rax, [img_H]
+        call    itoa
+        mov     byte [rdi], 10
+        inc     rdi
+        mov     byte [rdi],   '2'
+        mov     byte [rdi+1], '5'
+        mov     byte [rdi+2], '5'
+        mov     byte [rdi+3], 10
+        add     rdi, 4
+
+        ; write header
+        lea     rsi, [pgm_hdr]
+        mov     rdx, rdi
+        sub     rdx, rsi
+        mov     edi, STDOUT
+        mov     eax, SYS_WRITE
+        syscall
+
+        ; write data
+        mov     rdx, [img_W]
+        imul    rdx, [img_H]
+        lea     rsi, [output_buf]
+        mov     edi, STDOUT
+        mov     eax, SYS_WRITE
+        syscall
+        ret
+
+emit_empty_pgm:
+        lea     rdi, [pgm_hdr]
+        mov     byte [rdi],   'P'
+        mov     byte [rdi+1], '5'
+        mov     byte [rdi+2], 10
+        mov     byte [rdi+3], '1'
+        mov     byte [rdi+4], ' '
+        mov     byte [rdi+5], '1'
+        mov     byte [rdi+6], 10
+        mov     byte [rdi+7], '2'
+        mov     byte [rdi+8], '5'
+        mov     byte [rdi+9], '5'
+        mov     byte [rdi+10], 10
+        mov     byte [rdi+11], 0
+        mov     edx, 12
+        lea     rsi, [pgm_hdr]
+        mov     edi, STDOUT
+        mov     eax, SYS_WRITE
+        syscall
+        ret
+
+; ---------------------------------------------------------------------
+; itoa — rax = unsigned value, rdi = output buffer (writes ASCII,
+; ADVANCES rdi past last char). No null terminator.
+itoa:
+        push    rbx
+        push    r12
+        push    r13
+        mov     r12, rdi                 ; remember start
+        mov     rbx, 10
+        test    rax, rax
+        jnz     .l
+        mov     byte [rdi], '0'
+        inc     rdi
+        jmp     .ret
+.l:
+        mov     r13, rdi                 ; remember pre-loop end
+.l2:
+        xor     edx, edx
+        div     rbx
+        add     dl, '0'
+        mov     [rdi], dl
+        inc     rdi
+        test    rax, rax
+        jnz     .l2
+        ; reverse from r13..rdi-1
+        lea     rcx, [rdi - 1]
+.rev:
+        cmp     r13, rcx
+        jge     .ret
+        mov     al, [r13]
+        mov     dl, [rcx]
+        mov     [r13], dl
+        mov     [rcx], al
+        inc     r13
+        dec     rcx
+        jmp     .rev
+.ret:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; dump_metrics — print W/H/bigW/bigH/edges to stderr.
+dump_metrics:
+        push    rbx
+        mov     edi, STDERR
+        lea     rsi, [dump_dim_lbl]
+        mov     edx, dump_dim_lbl_len
+        mov     eax, SYS_WRITE
+        syscall
+        mov     rax, [img_W]
+        call    print_dec_stderr
+
+        mov     edi, STDERR
+        lea     rsi, [dump_h_lbl]
+        mov     edx, dump_h_lbl_len
+        mov     eax, SYS_WRITE
+        syscall
+        mov     rax, [img_H]
+        call    print_dec_stderr
+
+        mov     edi, STDERR
+        lea     rsi, [dump_bigw_lbl]
+        mov     edx, dump_bigw_lbl_len
+        mov     eax, SYS_WRITE
+        syscall
+        mov     rax, [img_bigW]
+        call    print_dec_stderr
+
+        mov     edi, STDERR
+        lea     rsi, [dump_bigh_lbl]
+        mov     edx, dump_bigh_lbl_len
+        mov     eax, SYS_WRITE
+        syscall
+        mov     rax, [img_bigH]
+        call    print_dec_stderr
+
+        mov     edi, STDERR
+        lea     rsi, [dump_edges_lbl]
+        mov     edx, dump_edges_lbl_len
+        mov     eax, SYS_WRITE
+        syscall
+        mov     rax, [e_count]
+        call    print_dec_stderr
+
+        mov     edi, STDERR
+        lea     rsi, [nl_str]
+        mov     edx, 1
+        mov     eax, SYS_WRITE
+        syscall
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+dump_points_debug:
+        push    rbx
+        mov     rcx, [out_numPoints]
+        xor     ebx, ebx
+.l:
+        cmp     rbx, rcx
+        jge     .d
+        push    rcx
+        push    rbx
+        mov     rax, rbx
+        call    print_dec_stderr
+        pop     rbx
+        pop     rcx
+        mov     edi, STDERR
+        mov     byte [dec_buf], ':'
+        mov     byte [dec_buf+1], ' '
+        lea     rsi, [dec_buf]
+        mov     edx, 2
+        mov     eax, SYS_WRITE
+        syscall
+        push    rcx
+        push    rbx
+        movsxd  rax, dword [pt_x + rbx*4]
+        call    print_signed_stderr
+        pop     rbx
+        pop     rcx
+        mov     edi, STDERR
+        mov     byte [dec_buf], ','
+        lea     rsi, [dec_buf]
+        mov     edx, 1
+        mov     eax, SYS_WRITE
+        syscall
+        push    rcx
+        push    rbx
+        movsxd  rax, dword [pt_y + rbx*4]
+        call    print_signed_stderr
+        pop     rbx
+        pop     rcx
+        push    rcx
+        push    rbx
+        movzx   eax, byte [pt_flags + rbx]
+        and     eax, 1
+        add     al, '0'
+        mov     [dec_buf], byte ' '
+        mov     [dec_buf+1], al
+        mov     [dec_buf+2], byte 10
+        mov     edi, STDERR
+        lea     rsi, [dec_buf]
+        mov     edx, 3
+        mov     eax, SYS_WRITE
+        syscall
+        pop     rbx
+        pop     rcx
+        inc     rbx
+        jmp     .l
+.d:
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+dump_edges_debug:
+        push    rbx
+        push    r12
+        mov     r12, [e_count]
+        xor     rbx, rbx
+.l:
+        cmp     rbx, r12
+        jge     .d
+        ; "edge i: y[a..b) x0=N dx=N dir=±1\n"
+        mov     rax, rbx
+        call    print_dec_stderr
+        mov     edi, STDERR
+        lea     rsi, [edge_lbl_y]
+        mov     edx, edge_lbl_y_len
+        mov     eax, SYS_WRITE
+        syscall
+        movsxd  rax, dword [e_ymin + rbx*4]
+        call    print_signed_stderr
+        mov     edi, STDERR
+        lea     rsi, [dump_comma]
+        mov     edx, 1
+        mov     eax, SYS_WRITE
+        syscall
+        movsxd  rax, dword [e_ymax + rbx*4]
+        call    print_signed_stderr
+        mov     edi, STDERR
+        lea     rsi, [edge_lbl_x0]
+        mov     edx, edge_lbl_x0_len
+        mov     eax, SYS_WRITE
+        syscall
+        movsxd  rax, dword [e_x0 + rbx*4]
+        sar     rax, 16
+        call    print_signed_stderr
+        mov     edi, STDERR
+        lea     rsi, [edge_lbl_dir]
+        mov     edx, edge_lbl_dir_len
+        mov     eax, SYS_WRITE
+        syscall
+        movsx   eax, byte [e_dir + rbx]
+        call    print_signed_stderr
+        mov     edi, STDERR
+        lea     rsi, [nl_str]
+        mov     edx, 1
+        mov     eax, SYS_WRITE
+        syscall
+        inc     rbx
+        jmp     .l
+.d:
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; print_signed_stderr: rax = signed 64-bit, prints to stderr with sign.
+print_signed_stderr:
+        test    rax, rax
+        jns     print_dec_stderr
+        push    rax
+        mov     edi, STDERR
+        mov     byte [dec_buf], '-'
+        lea     rsi, [dec_buf]
+        mov     edx, 1
+        mov     eax, SYS_WRITE
+        syscall
+        pop     rax
+        neg     rax
+        jmp     print_dec_stderr
+
+; ---------------------------------------------------------------------
+; print_dec_stderr: rax = value, prints decimal to stderr.
+print_dec_stderr:
+        push    rbx
+        push    r12
+        lea     r12, [dec_buf + 31]     ; write backwards
+        mov     byte [r12], 0
+        mov     rbx, 10
+        test    rax, rax
+        jnz     .l
+        dec     r12
+        mov     byte [r12], '0'
+        jmp     .emit
+.l:
+        xor     edx, edx
+        div     rbx
+        dec     r12
+        add     dl, '0'
+        mov     [r12], dl
+        test    rax, rax
+        jnz     .l
+.emit:
+        lea     rax, [dec_buf + 31]
+        sub     rax, r12
+        mov     edx, eax
+        mov     rsi, r12
+        mov     edi, STDERR
+        mov     eax, SYS_WRITE
+        syscall
+        pop     r12
+        pop     rbx
+        ret
