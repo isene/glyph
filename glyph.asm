@@ -275,6 +275,7 @@ _gv_int_end:            resw 4
 _gv_have_intermediate:  resq 1
 _gv_scalar_q:           resq 1
 _gv_size_tmp:           resq 1
+_ag_start_contours:     resq 1          ; first contour index for current apply call
 
 ; ---- IUP (Interpolation of Untouched Points) per-tuple state ----
 _gv_dx_dense:           resd MAX_POINTS         ; dense per-point i32 X delta
@@ -455,13 +456,15 @@ _start:
         cmp     eax, 2
         je      .err_too_many
 
-        ; Apply gvar deltas if outer glyph is simple (composites: TODO)
+        ; Apply gvar to the OUTER simple glyph (if it is simple).
+        ; Composites get gvar applied per-component inside parse_composite_into.
         mov     rdi, [glyf_off]
         call    be_i16
         test    rax, rax
         js      .skip_single_gvar
         mov     rdi, [glyph_id]
-        xor     rsi, rsi                  ; start_pts = 0 (single mode)
+        xor     rsi, rsi                  ; start_pts = 0
+        xor     rdx, rdx                  ; start_contours = 0
         call    apply_gvar_to_simple
 .skip_single_gvar:
 
@@ -569,7 +572,8 @@ _start:
         cmp     eax, 2
         je      .err_too_many
 
-        ; gvar for simple outer glyph
+        ; gvar for simple outer glyph (composites handled inside
+        ; parse_composite_into, per component)
         mov     rdi, [glyf_off]
         push    rbx
         call    be_i16
@@ -579,10 +583,8 @@ _start:
         movsxd  rax, dword [str_glyph_ids + rbx*4]
         mov     rdi, rax
         push    rbx
-        ; start_pts = 0 (we cleared out_numPoints above for each char)
-        ; Actually we DON'T reset out_numPoints between chars in str mode —
-        ; we re-enter parse_glyf which DOES reset. So start_pts is always 0.
-        xor     rsi, rsi
+        xor     rsi, rsi                  ; start_pts = 0
+        xor     rdx, rdx                  ; start_contours = 0
         call    apply_gvar_to_simple
         pop     rbx
 .s_no_gvar:
@@ -1769,13 +1771,16 @@ iup_axis:
         ret
 
 ; ---------------------------------------------------------------------
-; apply_gvar_to_simple — apply gvar deltas to the just-parsed simple
-; glyph's points.  rdi = glyph_id, rsi = start_pts (base index into
-; pt_x[]/pt_y[] for this glyph's points).  Modifies pt_x[]/pt_y[].
+; apply_gvar_to_simple — apply gvar deltas to a simple glyph's points
+; (which may live anywhere in the pt_x[]/pt_y[] arrays — this is what
+; lets composite components carry per-weight gvar deltas).
 ;
-; If no fvar/gvar or norm_coord_q == 0 (default master), returns early.
-; Multi-axis support is single-axis only (axis 0).  Only the outline's
-; real points are mutated; phantom-point deltas are ignored.
+;   rdi = glyph_id of the simple glyph whose gvar to read
+;   rsi = start_pts       (this component's first point index)
+;   rdx = start_contours  (this component's first contour index)
+;
+; If no gvar or norm_coord_q == 0 (default master), returns early.
+; Single-axis variation only (axis 0).  Phantom points are skipped.
 apply_gvar_to_simple:
         push    rbx
         push    r12
@@ -1786,6 +1791,7 @@ apply_gvar_to_simple:
 
         mov     rbx, rdi                 ; glyph_id
         mov     r15, rsi                 ; start_pts
+        mov     [_ag_start_contours], rdx
 
         cmp     qword [tbl_gvar_off], 0
         je      .ret
@@ -1952,44 +1958,67 @@ apply_gvar_to_simple:
         call    gv_decode_deltas
 
         ; ---- Build dense deltas + touched flags, run IUP, then apply ----
-        ; (start_pts is always 0 here — parse_glyf resets out_numPoints)
+        ; Operate only on this component's slice [start_pts .. out_numPoints).
         push    r15
-        ; clear _gv_touched, _gv_dx_dense, _gv_dy_dense for out_numPoints entries
         mov     rcx, [out_numPoints]
+        sub     rcx, r15                  ; npts_this = component's points
+        push    rcx                       ; save npts_this
+        ; Clear _gv_touched[start_pts .. start_pts + npts_this)
         lea     rdi, [_gv_touched]
+        add     rdi, r15
         xor     eax, eax
         rep     stosb
-        mov     rcx, [out_numPoints]
+        ; Clear _gv_dx_dense and _gv_dy_dense in same range
+        mov     rcx, [rsp]                ; npts_this
         lea     rdi, [_gv_dx_dense]
+        lea     rdi, [rdi + r15*4]
         xor     eax, eax
         rep     stosd
-        mov     rcx, [out_numPoints]
+        mov     rcx, [rsp]
         lea     rdi, [_gv_dy_dense]
+        lea     rdi, [rdi + r15*4]
         xor     eax, eax
         rep     stosd
+        pop     rcx                       ; npts_this
         pop     r15
+        push    rcx                       ; keep npts_this on stack for fill bound
 
-        ; Fill from explicit deltas (skip phantom indices ≥ out_numPoints)
+        ; Fill from explicit deltas (skip phantom & out-of-range indices).
         xor     rdx, rdx
 .fill_loop:
         cmp     rdx, [_gv_pts_n]
         jge     .fill_done
         movzx   r8d, word [_gv_pts + rdx*2]
-        cmp     r8, [out_numPoints]
+        cmp     r8, qword [rsp]           ; r8 < npts_this
         jge     .fill_skip
-        mov     byte [_gv_touched + r8], 1
+        ; absolute index = start_pts + r8
+        mov     r9, r15
+        add     r9, r8
+        mov     byte [_gv_touched + r9], 1
         movsx   eax, word [_gv_x_deltas + rdx*2]
-        mov     [_gv_dx_dense + r8*4], eax
+        mov     [_gv_dx_dense + r9*4], eax
         movsx   eax, word [_gv_y_deltas + rdx*2]
-        mov     [_gv_dy_dense + r8*4], eax
+        mov     [_gv_dy_dense + r9*4], eax
 .fill_skip:
         inc     rdx
         jmp     .fill_loop
 .fill_done:
+        pop     rcx                       ; discard npts_this
 
-        ; Run IUP per contour, X then Y axis.
-        xor     r10, r10                 ; contour idx
-        xor     r11, r11                 ; contour start
+        ; Run IUP per contour for this component only:
+        ; contours [start_contours .. out_numContours).
+        mov     r10, [_ag_start_contours]
+        ; r11 = contour start (absolute pt index). For the FIRST contour of
+        ; this component, start = start_pts. Otherwise start = previous
+        ; contour_end + 1.
+        cmp     r10, 0
+        je      .iup_first_glyph
+        mov     eax, [contour_end + r10*4 - 4]
+        movsxd  r11, eax
+        inc     r11
+        jmp     .iup_c_loop
+.iup_first_glyph:
+        mov     r11, r15                  ; start_pts
 .iup_c_loop:
         cmp     r10, [out_numContours]
         jge     .iup_c_done
@@ -1998,28 +2027,28 @@ apply_gvar_to_simple:
         push    r11
         push    rdx
         mov     rdi, r11
-        mov     rsi, rdx
+        movsxd  rsi, edx
         lea     rdx, [pt_x]
         lea     rcx, [_gv_dx_dense]
         call    iup_axis
         pop     rdx
         push    rdx
         mov     rdi, r11
-        mov     rsi, rdx
+        movsxd  rsi, edx
         lea     rdx, [pt_y]
         lea     rcx, [_gv_dy_dense]
         call    iup_axis
         pop     rdx
         pop     r11
         pop     r10
-        mov     r11, rdx
+        movsxd  r11, edx
         inc     r11
         inc     r10
         jmp     .iup_c_loop
 .iup_c_done:
 
-        ; Apply scalar*delta to every point.
-        xor     rdx, rdx
+        ; Apply scalar*delta to this component's points only.
+        mov     rdx, r15
 .app_loop:
         cmp     rdx, [out_numPoints]
         jge     .app_done
@@ -2758,12 +2787,27 @@ parse_composite_into:
         test    rax, rax
         js      .skip_comp
 
+        ; Save the component's start indices for the gvar pass.
+        push    qword [out_numPoints]
+        push    qword [out_numContours]
+
         ; parse_simple_into(rdi=glyf_off, rsi=dx, rdx=dy)
         mov     rsi, r15
         mov     rdx, rbp
         call    parse_simple_into
         cmp     eax, 2
-        je      .done
+        je      .done_pop2
+
+        ; Apply the COMPONENT's own gvar deltas to its newly-added points.
+        pop     rdx                       ; start_contours
+        pop     rsi                       ; start_pts
+        push    rsi                       ; restore for stack discipline
+        push    rdx
+        mov     rdi, r14                  ; component glyph_id
+        ; rsi/rdx already set
+        call    apply_gvar_to_simple
+
+        add     rsp, 16                   ; drop the saved start_* values
 
 .skip_comp:
         test    r13, CF_MORE_COMPONENTS
@@ -2777,6 +2821,9 @@ parse_composite_into:
         pop     r12
         pop     rbx
         ret
+.done_pop2:
+        add     rsp, 16
+        jmp     .done
 
 ; ---------------------------------------------------------------------
 ; dump_outline — print numContours/numPoints + bbox.
