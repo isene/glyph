@@ -276,6 +276,11 @@ _gv_have_intermediate:  resq 1
 _gv_scalar_q:           resq 1
 _gv_size_tmp:           resq 1
 
+; ---- IUP (Interpolation of Untouched Points) per-tuple state ----
+_gv_dx_dense:           resd MAX_POINTS         ; dense per-point i32 X delta
+_gv_dy_dense:           resd MAX_POINTS         ; dense per-point i32 Y delta
+_gv_touched:            resb MAX_POINTS         ; 1 if explicit, 0 if inferred
+
 ; ---- rasterizer state ----
 %define SS              4                       ; supersample factor
 %define MAX_OUT_DIM     512                     ; max output W or H
@@ -1603,6 +1608,167 @@ gv_compute_scalar:
         ret
 
 ; ---------------------------------------------------------------------
+; iup_axis — Interpolation of Untouched Points along one axis.
+;   in : rdi = contour start index (absolute, in pt_*[] / _gv_touched)
+;        rsi = contour end index (inclusive)
+;        rdx = ptr to original coord array (pt_x or pt_y)
+;        rcx = ptr to dense delta array (_gv_dx_dense or _gv_dy_dense)
+;
+; For each untouched point in the contour, compute its delta by
+; interpolation between the cyclically-nearest touched neighbours.
+; If no touched points in this contour, leave deltas at 0.
+iup_axis:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        push    rbp
+
+        mov     r12, rdi                 ; contour start
+        mov     r13, rsi                 ; contour end (inclusive)
+        mov     r14, rdx                 ; coords ptr
+        mov     r15, rcx                 ; deltas ptr
+        mov     rbp, r13
+        sub     rbp, r12
+        inc     rbp                      ; n = end - start + 1
+        cmp     rbp, 2
+        jl      .ret
+
+        ; Any touched in this contour?
+        xor     rbx, rbx
+.has_loop:
+        cmp     rbx, rbp
+        jge     .ret
+        mov     rax, r12
+        add     rax, rbx
+        cmp     byte [_gv_touched + rax], 0
+        jne     .iter_init
+        inc     rbx
+        jmp     .has_loop
+
+.iter_init:
+        xor     rbx, rbx
+.iter:
+        cmp     rbx, rbp
+        jge     .ret
+        mov     rax, r12
+        add     rax, rbx
+        cmp     byte [_gv_touched + rax], 0
+        jne     .nxt
+
+        ; Find prev touched (cyclic backward)
+        mov     rcx, rbx
+.find_L:
+        test    rcx, rcx
+        jnz     .dec_L
+        mov     rcx, rbp
+.dec_L:
+        dec     rcx
+        cmp     rcx, rbx
+        je      .single
+        mov     rax, r12
+        add     rax, rcx
+        cmp     byte [_gv_touched + rax], 0
+        je      .find_L
+        mov     rdi, rcx                 ; rdi = L (local)
+
+        ; Find next touched (cyclic forward)
+        mov     rcx, rbx
+.find_R:
+        inc     rcx
+        cmp     rcx, rbp
+        jl      .check_R
+        xor     rcx, rcx
+.check_R:
+        cmp     rcx, rbx
+        je      .single_with_L
+        mov     rax, r12
+        add     rax, rcx
+        cmp     byte [_gv_touched + rax], 0
+        je      .find_R
+        mov     rsi, rcx                 ; rsi = R (local)
+
+        ; Load pos_L, d_L, pos_R, d_R, pos_P
+        mov     rax, r12
+        add     rax, rdi
+        movsxd  r8, dword [r14 + rax*4]  ; pos_L
+        movsxd  r10, dword [r15 + rax*4] ; d_L
+        mov     rax, r12
+        add     rax, rsi
+        movsxd  r9, dword [r14 + rax*4]  ; pos_R
+        movsxd  r11, dword [r15 + rax*4] ; d_R
+        mov     rax, r12
+        add     rax, rbx
+        movsxd  rdi, dword [r14 + rax*4] ; pos_P (rdi reused as scratch)
+
+        ; Order so r8 = min_pos with corresponding r10 = its delta.
+        cmp     r8, r9
+        jle     .ordered
+        xchg    r8, r9
+        xchg    r10, r11
+.ordered:
+        cmp     r8, r9
+        jne     .differ
+        ; pos_L == pos_R: use d_L if equal, else 0
+        cmp     r10, r11
+        jne     .zero_d
+        mov     rax, r10
+        jmp     .write
+.differ:
+        cmp     rdi, r8
+        jl      .below
+        cmp     rdi, r9
+        jg      .above
+        ; interpolate: delta = d_min + (pos_P - min_pos) * (d_max - d_min) / (max_pos - min_pos)
+        mov     rax, rdi
+        sub     rax, r8
+        mov     rcx, r11
+        sub     rcx, r10
+        imul    rax, rcx
+        mov     rcx, r9
+        sub     rcx, r8
+        cqo
+        idiv    rcx
+        add     rax, r10
+        jmp     .write
+.below:
+        mov     rax, r10
+        jmp     .write
+.above:
+        mov     rax, r11
+        jmp     .write
+.zero_d:
+        xor     eax, eax
+.write:
+        mov     rcx, r12
+        add     rcx, rbx
+        mov     [r15 + rcx*4], eax
+.nxt:
+        inc     rbx
+        jmp     .iter
+
+.single_with_L:
+        mov     rax, r12
+        add     rax, rdi
+        movsxd  rax, dword [r15 + rax*4]
+        mov     rcx, r12
+        add     rcx, rbx
+        mov     [r15 + rcx*4], eax
+        jmp     .nxt
+.single:
+        ; Only this point is "untouched" in a contour with 1 point — leave 0.
+        jmp     .nxt
+.ret:
+        pop     rbp
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
 ; apply_gvar_to_simple — apply gvar deltas to the just-parsed simple
 ; glyph's points.  rdi = glyph_id, rsi = start_pts (base index into
 ; pt_x[]/pt_y[] for this glyph's points).  Modifies pt_x[]/pt_y[].
@@ -1785,37 +1951,89 @@ apply_gvar_to_simple:
         lea     rsi, [_gv_y_deltas]
         call    gv_decode_deltas
 
-        ; Apply scalar*delta to pt_x[start_pts + pt]/pt_y[start_pts + pt]
-        ; for each pt in _gv_pts where pt < (out_numPoints - start_pts).
-        mov     rcx, [_gv_pts_n]
-        mov     rax, [out_numPoints]
-        sub     rax, r15
-        ; rax = max real points (4 phantom points beyond are out of bounds)
-        push    rax
+        ; ---- Build dense deltas + touched flags, run IUP, then apply ----
+        ; (start_pts is always 0 here — parse_glyf resets out_numPoints)
+        push    r15
+        ; clear _gv_touched, _gv_dx_dense, _gv_dy_dense for out_numPoints entries
+        mov     rcx, [out_numPoints]
+        lea     rdi, [_gv_touched]
+        xor     eax, eax
+        rep     stosb
+        mov     rcx, [out_numPoints]
+        lea     rdi, [_gv_dx_dense]
+        xor     eax, eax
+        rep     stosd
+        mov     rcx, [out_numPoints]
+        lea     rdi, [_gv_dy_dense]
+        xor     eax, eax
+        rep     stosd
+        pop     r15
+
+        ; Fill from explicit deltas (skip phantom indices ≥ out_numPoints)
+        xor     rdx, rdx
+.fill_loop:
+        cmp     rdx, [_gv_pts_n]
+        jge     .fill_done
+        movzx   r8d, word [_gv_pts + rdx*2]
+        cmp     r8, [out_numPoints]
+        jge     .fill_skip
+        mov     byte [_gv_touched + r8], 1
+        movsx   eax, word [_gv_x_deltas + rdx*2]
+        mov     [_gv_dx_dense + r8*4], eax
+        movsx   eax, word [_gv_y_deltas + rdx*2]
+        mov     [_gv_dy_dense + r8*4], eax
+.fill_skip:
+        inc     rdx
+        jmp     .fill_loop
+.fill_done:
+
+        ; Run IUP per contour, X then Y axis.
+        xor     r10, r10                 ; contour idx
+        xor     r11, r11                 ; contour start
+.iup_c_loop:
+        cmp     r10, [out_numContours]
+        jge     .iup_c_done
+        mov     edx, [contour_end + r10*4]
+        push    r10
+        push    r11
+        push    rdx
+        mov     rdi, r11
+        mov     rsi, rdx
+        lea     rdx, [pt_x]
+        lea     rcx, [_gv_dx_dense]
+        call    iup_axis
+        pop     rdx
+        push    rdx
+        mov     rdi, r11
+        mov     rsi, rdx
+        lea     rdx, [pt_y]
+        lea     rcx, [_gv_dy_dense]
+        call    iup_axis
+        pop     rdx
+        pop     r11
+        pop     r10
+        mov     r11, rdx
+        inc     r11
+        inc     r10
+        jmp     .iup_c_loop
+.iup_c_done:
+
+        ; Apply scalar*delta to every point.
         xor     rdx, rdx
 .app_loop:
-        cmp     rdx, rcx
+        cmp     rdx, [out_numPoints]
         jge     .app_done
-        movzx   r8d, word [_gv_pts + rdx*2]
-        cmp     r8, qword [rsp]
-        jge     .app_skip
-        ; xdelta * scalar / 16384
-        movsx   rax, word [_gv_x_deltas + rdx*2]
+        movsxd  rax, dword [_gv_dx_dense + rdx*4]
         imul    rax, [_gv_scalar_q]
         sar     rax, 14
-        mov     r9, r15
-        add     r9, r8
-        add     [pt_x + r9*4], eax
-        ; ydelta * scalar / 16384
-        movsx   rax, word [_gv_y_deltas + rdx*2]
+        add     [pt_x + rdx*4], eax
+        movsxd  rax, dword [_gv_dy_dense + rdx*4]
         imul    rax, [_gv_scalar_q]
         sar     rax, 14
-        add     [pt_y + r9*4], eax
-.app_skip:
+        add     [pt_y + rdx*4], eax
         inc     rdx
         jmp     .app_loop
 .app_done:
-        pop     rax
         ; Advance _gv_data_block past the consumed bytes (variationDataSize)
         mov     rax, [_gv_data_block]
         add     rax, [_gv_size_tmp]
