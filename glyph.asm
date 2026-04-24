@@ -1415,13 +1415,13 @@ gv_decode_deltas:
         mov     ebx, eax
         and     ebx, 0x3F
         inc     ebx                      ; run length 1..64
-        mov     ecx, eax
-        and     ecx, 0xC0                ; control bits
-        cmp     ecx, 0x80
-        je      .word_run
-        cmp     ecx, 0x40                ; bit 6 set, bit 7 clear → zero deltas
-        je      .zero_run
-        ; default 0x00 → byte deltas
+        ; bit 7 (0x80) = ZERO deltas, bit 6 (0x40) = WORD deltas (per OT spec /
+        ; fontTools); both clear = byte deltas.
+        test    al, 0x80
+        jnz     .zero_run
+        test    al, 0x40
+        jnz     .word_run
+        ; default → byte deltas
 .byte_run:
         test    ebx, ebx
         jz      .runs
