@@ -815,15 +815,38 @@ glyph_render_to_alpha:
         call    rasterize
         call    box_filter
 
-        ; bearing_x_pixels = round(xMin * arg_size / unitsPerEm)
+        ; bearing_x_pixels = round_to_nearest(xMin * arg_size / unitsPerEm)
+        ; bearing_y_pixels = round_to_nearest(yMax * arg_size / unitsPerEm)
+        ; idiv truncates toward zero. With pure truncation, two glyphs
+        ; whose true bearings sit on opposite sides of an integer (e.g.
+        ; 'b' = 13.51 px, 'u' = 12.49 px) collapse to 13 vs 12 — visibly
+        ; different baselines in the rendered text. Add ±UPE/2 before
+        ; division for symmetric round-to-nearest, so two glyphs with the
+        ; same true baseline land on the same integer pixel.
+        mov     rcx, [head_unitsPerEm]
+        shr     rcx, 1                   ; UPE/2 (positive)
+
         mov     rax, [out_xMin]
         imul    rax, [arg_size]
+        ; symmetric rounding bias: +UPE/2 when rax≥0, -UPE/2 when rax<0
+        mov     rdx, rcx
+        test    rax, rax
+        jns     .br_x_pos
+        neg     rdx
+.br_x_pos:
+        add     rax, rdx
         cqo
         idiv    qword [head_unitsPerEm]
         mov     r8, rax
-        ; bearing_y_pixels = round(yMax * arg_size / unitsPerEm)
+
         mov     rax, [out_yMax]
         imul    rax, [arg_size]
+        mov     rdx, rcx
+        test    rax, rax
+        jns     .br_y_pos
+        neg     rdx
+.br_y_pos:
+        add     rax, rdx
         cqo
         idiv    qword [head_unitsPerEm]
         mov     r9, rax
