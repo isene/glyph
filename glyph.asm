@@ -150,6 +150,17 @@ tag_avar:       db "avar"
 tag_wght:       db "wght"
 
 ; ---------------------------------------------------------------------
+; Gamma LUT — coverage-bin (0..16, since SS=4 → 16 samples per pixel) to
+; perceptual alpha (0..255). Maps linear coverage through gamma γ ≈ 1.43
+; (alpha = 255·cov^0.7), matching FreeType's default "stem darkening"
+; correction for sRGB displays. Without it, mid-coverage (8/16) maps to
+; alpha 128 — which a 2.2-gamma monitor displays at ~22% perceived
+; brightness, making anti-aliased text look thin and pale. With
+; γ-correction, 50%-cov pixels emit alpha 148 → ~31% perceived → bolder,
+; closer to what FreeType+XRender produces for kitty.
+gamma_lut:      db 0, 35, 56, 74, 91, 106, 120, 134, 148, 161, 174, 186, 199, 211, 222, 234, 255
+
+; ---------------------------------------------------------------------
 section .bss
 
 stat_buf:       resb 144
@@ -804,9 +815,6 @@ glyph_render_to_alpha:
         call    rasterize
         call    box_filter
 
-        ; metrics for caller
-        mov     rcx, [img_W]
-        mov     rdx, [img_H]
         ; bearing_x_pixels = round(xMin * arg_size / unitsPerEm)
         mov     rax, [out_xMin]
         imul    rax, [arg_size]
@@ -830,6 +838,11 @@ glyph_render_to_alpha:
         cqo
         idiv    rbx
         mov     r10, rax
+
+        ; Load W and H AFTER all the divisions — cqo clobbers rdx,
+        ; so reading img_H into rdx before any cqo would lose it.
+        mov     rcx, [img_W]
+        mov     rdx, [img_H]
 
         xor     eax, eax
         pop     r15
@@ -3925,10 +3938,12 @@ box_filter:
         inc     rcx
         jmp     .sy_loop
 .sy_done:
-        ; alpha = sum * 255 / 16
+        ; alpha = gamma_lut[sum]  (sum ∈ 0..16, gamma ≈ 1.43 → bolder mids)
+        ; Linear sum*255/16 made AA glyphs look pale on dark backgrounds;
+        ; the LUT applies sRGB-ish gamma correction so coverage maps to
+        ; perceptual brightness, matching FreeType+kitty appearance.
         mov     eax, edi
-        imul    eax, 255
-        shr     eax, 4                   ; /16 (SS*SS)
+        movzx   eax, byte [gamma_lut + rax]
         ; store
         mov     rdx, r15
         imul    rdx, r12
