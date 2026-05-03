@@ -165,10 +165,26 @@ section .bss
 
 stat_buf:       resb 144
 
-; argv-derived
+; ---- per-render arguments (re-set on every call; NOT part of the
+;      multi-font snapshot block below) ----
 arg_font_path:  resq 1          ; pointer
 arg_codepoint:  resq 1          ; parsed integer
 arg_size:       resq 1          ; parsed integer (pixel size)
+arg_weight:     resq 1          ; user-requested weight (0 = default)
+norm_coord_q:   resq 1          ; normalized weight in F2DOT14
+oblique_mode:   resb 1          ; 1 = apply 12° shear post-rasterise
+synthetic_bold_mode: resb 1     ; 1 = horizontal alpha-dilation by 1px
+alignb 8
+
+; ──────────────────────────────────────────────────────────────────
+; PER-FONT STATE — contiguous block, save/restored as a single
+; memcpy via glyph_save_pf_state / glyph_restore_pf_state. Glass
+; loads N fonts (regular / italic / bold / bold-italic / emoji /
+; …), saves each one's parsed state into a slot, and swaps slots
+; before each render. Adding fields here automatically makes them
+; per-font; per-render scratch must live OUTSIDE this block.
+; ──────────────────────────────────────────────────────────────────
+glyph_pf_state:
 
 ; mmap state
 font_fd:        resq 1
@@ -202,13 +218,6 @@ fvar_axis_count:        resq 1
 fvar_wght_default:      resq 1          ; in user units (e.g. 400)
 fvar_wght_min:          resq 1
 fvar_wght_max:          resq 1
-arg_weight:             resq 1          ; user-requested weight (0 = default)
-norm_coord_q:           resq 1          ; normalized weight in F2DOT14 (-16384..+16384)
-
-; ---- post-process flags (set per render via glyph_set_oblique /
-;      glyph_set_synthetic_bold). Both default to 0 = pass-through. ----
-oblique_mode:           resb 1          ; 1 = apply 12° shear post-rasterise
-synthetic_bold_mode:    resb 1          ; 1 = horizontal alpha-dilation by 1px
 
 ; ---- gvar parsed state ----
 gvar_axis_count:        resq 1
@@ -218,12 +227,6 @@ gvar_glyph_count:       resq 1
 gvar_flags:             resq 1
 gvar_data_array_ptr:    resq 1          ; absolute pointer to data array
 gvar_offsets_ptr:       resq 1          ; absolute pointer to offset array
-
-; (gvar transient state moved below MAX_POINTS definition.)
-
-; small scratch buffers
-hex_buf:        resb 32
-dec_buf:        resb 32
 
 ; ---- parsed head ----
 head_unitsPerEm:        resq 1          ; u16, unsigned
@@ -243,14 +246,21 @@ hhea_lineGap:           resq 1
 hhea_numLongMetrics:    resq 1          ; u16
 
 ; ---- cmap ----
-cmap_subtable_ptr:      resq 1          ; absolute pointer to chosen format-4 subtable
+cmap_subtable_ptr:      resq 1          ; absolute pointer to chosen subtable
 cmap_segCount:          resq 1
 cmap_endCode_ptr:       resq 1
 cmap_startCode_ptr:     resq 1
 cmap_idDelta_ptr:       resq 1
 cmap_idRangeOffset_ptr: resq 1
 
-; ---- per-codepoint resolution ----
+glyph_pf_state_end:
+GLYPH_PF_STATE_SIZE equ glyph_pf_state_end - glyph_pf_state
+
+; small scratch buffers (per-render, NOT part of the per-font block)
+hex_buf:        resb 32
+dec_buf:        resb 32
+
+; ---- per-codepoint resolution (per-render) ----
 glyph_id:               resq 1
 glyf_off:               resq 1          ; absolute file offset of this glyph's glyf entry
 glyf_len:               resq 1          ; bytes (0 = empty glyph)
@@ -745,6 +755,44 @@ glyph_load_font:
 ;        Recomputes norm_coord_q from arg_weight and fvar defaults.
 glyph_set_weight:
         mov     [arg_weight], rdi
+        call    compute_norm_coord
+        ret
+
+; ---------------------------------------------------------------------
+; glyph_save_pf_state — copy the live per-font state into a caller-
+; supplied buffer (must be at least GLYPH_PF_STATE_SIZE bytes,
+; currently 408 bytes). Used by glass to snapshot a freshly-loaded
+; font into one of N slots.
+;   in : rdi = destination buffer
+;   out: rax = number of bytes copied (= GLYPH_PF_STATE_SIZE)
+glyph_save_pf_state:
+        push    rsi
+        push    rcx
+        lea     rsi, [glyph_pf_state]
+        mov     rcx, GLYPH_PF_STATE_SIZE / 8
+        rep     movsq
+        mov     rax, GLYPH_PF_STATE_SIZE
+        pop     rcx
+        pop     rsi
+        ret
+
+; ---------------------------------------------------------------------
+; glyph_restore_pf_state — load a previously-saved per-font snapshot
+; back into the live state. Subsequent glyph_render_to_alpha calls use
+; that font. norm_coord_q is recomputed from the per-render
+; arg_weight + the new font's fvar defaults so the same user weight
+; gets normalised correctly across font swaps.
+;   in : rdi = source buffer (previously filled by glyph_save_pf_state)
+glyph_restore_pf_state:
+        push    rsi
+        push    rcx
+        mov     rsi, rdi
+        lea     rdi, [glyph_pf_state]
+        mov     rcx, GLYPH_PF_STATE_SIZE / 8
+        rep     movsq
+        pop     rcx
+        pop     rsi
+        ; Re-derive norm_coord_q for the new font's fvar.
         call    compute_norm_coord
         ret
 
