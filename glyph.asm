@@ -205,6 +205,11 @@ fvar_wght_max:          resq 1
 arg_weight:             resq 1          ; user-requested weight (0 = default)
 norm_coord_q:           resq 1          ; normalized weight in F2DOT14 (-16384..+16384)
 
+; ---- post-process flags (set per render via glyph_set_oblique /
+;      glyph_set_synthetic_bold). Both default to 0 = pass-through. ----
+oblique_mode:           resb 1          ; 1 = apply 12° shear post-rasterise
+synthetic_bold_mode:    resb 1          ; 1 = horizontal alpha-dilation by 1px
+
 ; ---- gvar parsed state ----
 gvar_axis_count:        resq 1
 gvar_shared_count:      resq 1
@@ -338,6 +343,8 @@ big_buffer:             resb (MAX_BIG_DIM * MAX_BIG_DIM)
 
 ; output greyscale buffer
 output_buf:             resb (MAX_OUT_DIM * MAX_OUT_DIM)
+; Scratch row buffer for in-place shear (one row × MAX_OUT_DIM bytes).
+post_row_tmp:           resb MAX_OUT_DIM
 
 %ifndef GLYPH_LIB
 ; PGM header scratch (CLI only)
@@ -742,6 +749,186 @@ glyph_set_weight:
         ret
 
 ; ---------------------------------------------------------------------
+; glyph_set_oblique — toggle synthetic italic via post-rasterise shear.
+;   in : rdi = 0 (off) or 1 (on)
+; The shear is applied per-row after rasterise: each row at distance d
+; pixels above the baseline shifts d * 13/64 ≈ tan(11.5°) pixels right;
+; rows below baseline shift left by the same factor. Output_buf is
+; shifted in place; pixels falling outside [0, img_W) are clipped.
+; Works on any TTF — no italic font file needed.
+glyph_set_oblique:
+        mov     [oblique_mode], dil
+        ret
+
+; ---------------------------------------------------------------------
+; glyph_set_synthetic_bold — toggle synthetic bold via 1-pixel horizontal
+; alpha-dilation post-rasterise.
+;   in : rdi = 0 (off) or 1 (on)
+; Each pixel ORs in the alpha of its left neighbour (bytewise max), so
+; stems thicken by one pixel to the right. Acceptable for monospace
+; cells with normal side bearing; for tight fonts a stem on the rightmost
+; column may clip by 1 px.
+glyph_set_synthetic_bold:
+        mov     [synthetic_bold_mode], dil
+        ret
+
+; ---------------------------------------------------------------------
+; apply_post_process — run any enabled post-rasterise effects on
+; output_buf. Inputs: r9 = bearing_y (rows above baseline). Preserves
+; r9 (and every caller-saved reg the render path needs after this).
+apply_post_process:
+        push    rax
+        push    rbx
+        push    rcx
+        push    rdx
+        push    rsi
+        push    rdi
+        push    r8
+        push    r10
+        push    r11
+        push    r12
+        push    r13
+        push    r14
+
+        ; --- Synthetic bold: horizontal 1-px dilation via byte-max.
+        ; For each row, walk x = W-1 down to 1 and set buf[x] = max(buf[x],
+        ; buf[x-1]). Right-to-left scan keeps each old left neighbour
+        ; live before its slot is overwritten.
+        cmp     byte [synthetic_bold_mode], 0
+        je      .pp_after_bold
+        mov     r12, [img_W]
+        test    r12, r12
+        jz      .pp_after_bold
+        mov     r13, [img_H]
+        test    r13, r13
+        jz      .pp_after_bold
+        xor     rcx, rcx                  ; row counter
+.pp_b_row:
+        cmp     rcx, r13
+        jge     .pp_after_bold
+        mov     rax, rcx
+        imul    rax, r12
+        lea     rsi, [output_buf]
+        add     rsi, rax                  ; row base
+        mov     rbx, r12
+        dec     rbx                       ; x = W-1
+.pp_b_col:
+        test    rbx, rbx
+        jz      .pp_b_row_done
+        movzx   eax, byte [rsi + rbx]
+        movzx   edx, byte [rsi + rbx - 1]
+        cmp     dl, al
+        jbe     .pp_b_keep
+        mov     al, dl
+.pp_b_keep:
+        mov     [rsi + rbx], al
+        dec     rbx
+        jmp     .pp_b_col
+.pp_b_row_done:
+        inc     rcx
+        jmp     .pp_b_row
+
+.pp_after_bold:
+        ; --- Oblique: per-row horizontal shift. shift_px = (bearing_y -
+        ; row) * 13 / 64 (positive shifts right, negative shifts left).
+        ; We copy each row to scratch, zero the row, then re-blit cells
+        ; into shifted x positions; out-of-range cells silently drop.
+        cmp     byte [oblique_mode], 0
+        je      .pp_done
+        mov     r12, [img_W]
+        test    r12, r12
+        jz      .pp_done
+        mov     r13, [img_H]
+        test    r13, r13
+        jz      .pp_done
+        cmp     r12, MAX_OUT_DIM
+        ja      .pp_done                   ; tmp buffer can't hold row
+        xor     rcx, rcx                  ; row counter
+.pp_o_row:
+        cmp     rcx, r13
+        jge     .pp_done
+        ; shift = (bearing_y - row) * 13 / 64. r9 holds bearing_y.
+        mov     rax, r9
+        sub     rax, rcx
+        imul    rax, 13
+        sar     rax, 6                    ; arithmetic >> 6 (signed)
+        mov     r11, rax                  ; r11 = signed shift
+
+        ; Compute row base.
+        mov     rax, rcx
+        imul    rax, r12
+        lea     rsi, [output_buf]
+        add     rsi, rax                  ; row base in output_buf
+
+        ; Copy row → post_row_tmp.
+        lea     rdi, [post_row_tmp]
+        mov     rdx, r12                  ; W bytes
+.pp_o_copy:
+        test    rdx, rdx
+        jz      .pp_o_zero_row
+        movzx   eax, byte [rsi]
+        mov     [rdi], al
+        inc     rsi
+        inc     rdi
+        dec     rdx
+        jmp     .pp_o_copy
+
+.pp_o_zero_row:
+        ; Zero the row in output_buf.
+        mov     rax, rcx
+        imul    rax, r12
+        lea     rsi, [output_buf]
+        add     rsi, rax
+        mov     rdx, r12
+.pp_o_zero:
+        test    rdx, rdx
+        jz      .pp_o_blit
+        mov     byte [rsi], 0
+        inc     rsi
+        dec     rdx
+        jmp     .pp_o_zero
+
+.pp_o_blit:
+        ; Re-blit shifted: for x in 0..W-1, dst_x = x + shift. Skip
+        ; out-of-range. r11 = shift (signed).
+        mov     rax, rcx
+        imul    rax, r12
+        lea     r10, [output_buf]
+        add     r10, rax                  ; row base
+        xor     rbx, rbx                  ; x = 0
+.pp_o_blit_col:
+        cmp     rbx, r12
+        jge     .pp_o_row_done
+        mov     rax, rbx
+        add     rax, r11                  ; dst_x = x + shift
+        js      .pp_o_blit_skip            ; dst_x < 0
+        cmp     rax, r12
+        jge     .pp_o_blit_skip            ; dst_x >= W
+        movzx   edx, byte [post_row_tmp + rbx]
+        mov     [r10 + rax], dl
+.pp_o_blit_skip:
+        inc     rbx
+        jmp     .pp_o_blit_col
+.pp_o_row_done:
+        inc     rcx
+        jmp     .pp_o_row
+
+.pp_done:
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     r11
+        pop     r10
+        pop     r8
+        pop     rdi
+        pop     rsi
+        pop     rdx
+        pop     rcx
+        pop     rbx
+        pop     rax
+        ret
+
+; ---------------------------------------------------------------------
 ; glyph_render_to_alpha — render a single glyph for a codepoint at
 ; the requested pixel size. The alpha mask is left in output_buf
 ; (img_W × img_H bytes, top-left origin, 0 = transparent, 255 = opaque).
@@ -861,6 +1048,11 @@ glyph_render_to_alpha:
         cqo
         idiv    rbx
         mov     r10, rax
+
+        ; Apply per-render post-process (synthetic bold + oblique). Both
+        ; are no-ops when their respective mode flag is 0 — the call
+        ; itself is then ~30 cycles, well below glyph cache amortisation.
+        call    apply_post_process
 
         ; Load W and H AFTER all the divisions — cqo clobbers rdx,
         ; so reading img_H into rdx before any cqo would lose it.
