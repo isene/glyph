@@ -2,7 +2,7 @@
 
 <img src="img/glyph.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.4.6-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~37KB-orange) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.4.7-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~37KB-orange) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 TrueType font rasterizer written in x86_64 Linux assembly. No libc, no
 runtime, no FreeType, no harfbuzz. Pure syscalls. Single static binary,
@@ -190,7 +190,7 @@ renders weirdly please open an issue with the font and codepoint.
       now thicken correctly when WEIGHT changes)
 - [ ] avar segment-map mapping (currently linear fvar → normalised)
 - [ ] Composite glyphs with scale / 2x2 transforms applied
-- [ ] cmap format 12 (codepoints above U+FFFF — CJK extensions, math)
+- [x] cmap format 12 (full Unicode coverage — SMP emoji, CJK ext, math)
 - [ ] Adaptive Bézier subdivision (curves still use 8 fixed steps;
       faceting visible at 64px+)
 - [ ] Library mode (link directly into [glass](https://github.com/isene/glass)

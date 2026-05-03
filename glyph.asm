@@ -247,11 +247,14 @@ hhea_numLongMetrics:    resq 1          ; u16
 
 ; ---- cmap ----
 cmap_subtable_ptr:      resq 1          ; absolute pointer to chosen subtable
-cmap_segCount:          resq 1
-cmap_endCode_ptr:       resq 1
-cmap_startCode_ptr:     resq 1
-cmap_idDelta_ptr:       resq 1
-cmap_idRangeOffset_ptr: resq 1
+cmap_format:            resq 1          ; 4 = BMP segmented, 12 = SMP sequential
+cmap_segCount:          resq 1          ; format 4: # of segments
+cmap_endCode_ptr:       resq 1          ; format 4
+cmap_startCode_ptr:     resq 1          ; format 4
+cmap_idDelta_ptr:       resq 1          ; format 4
+cmap_idRangeOffset_ptr: resq 1          ; format 4
+cmap_fmt12_groups_ptr:  resq 1          ; format 12: first SequentialMapGroup
+cmap_fmt12_numgroups:   resq 1          ; format 12: # of groups
 
 glyph_pf_state_end:
 GLYPH_PF_STATE_SIZE equ glyph_pf_state_end - glyph_pf_state
@@ -717,7 +720,7 @@ glyph_load_font:
         call    compute_norm_coord
         call    parse_gvar
 
-        call    find_cmap_format4
+        call    find_cmap_subtable
         test    rax, rax
         jnz     .e_cmap
 
@@ -756,6 +759,22 @@ glyph_load_font:
 glyph_set_weight:
         mov     [arg_weight], rdi
         call    compute_norm_coord
+        ret
+
+; ---------------------------------------------------------------------
+; glyph_has_glyph — quick "does the active font cover this codepoint?"
+; probe. Used by glass to decide between TTF rendering and the
+; emoji-pixmap fallback for codepoints above U+FFFF.
+;   in : rdi = codepoint
+;   out: rax = 1 if the font has a real glyph for it, 0 otherwise
+glyph_has_glyph:
+        call    cmap_lookup
+        test    rax, rax
+        jz      .none
+        mov     eax, 1
+        ret
+.none:
+        xor     eax, eax
         ret
 
 ; ---------------------------------------------------------------------
@@ -2561,8 +2580,10 @@ apply_gvar_to_simple:
         ret
 
 ; ---------------------------------------------------------------------
-; find_cmap_format4 — pick a Unicode cmap subtable in format 4 and
-; populate cmap_subtable_ptr + segment array pointers.
+; find_cmap_subtable — pick a Unicode cmap subtable, preferring
+; format 12 (full Unicode, codepoints up to U+10FFFF) over format 4
+; (BMP only) since glass needs SMP coverage for emoji/CJK ext/math.
+; Populates cmap_format + the appropriate per-format pointers.
 ; Returns 0 on success, 1 if no usable subtable.
 ;
 ; cmap header (4 bytes):
@@ -2573,10 +2594,13 @@ apply_gvar_to_simple:
 ;   u16 encodingID
 ;   u32 subtableOffset (from cmap table base)
 ;
-; Preferred subtable platform/encoding for Unicode BMP:
-;   (3, 1)  Microsoft Unicode BMP
-;   (0, *)  Unicode (anything; 0/3 most common for BMP)
-find_cmap_format4:
+; Preferred encodings:
+;   format 12: (3,10) Microsoft Unicode UCS-4
+;              (0,4)  Unicode 2.0 full
+;              (0,6)  Unicode full (newer)
+;   format 4:  (3,1)  Microsoft Unicode BMP
+;              (0,*)  Unicode (anything; 0/3 most common for BMP)
+find_cmap_subtable:
         push    rbx
         push    r12
         push    r13
@@ -2592,101 +2616,136 @@ find_cmap_format4:
 
         lea     r14, [r12 + 4]           ; r14 = first encoding record
 
+        ; Two stack slots: best format 12 ptr, best format 4 ptr.
+        push    qword 0                  ; [rsp+8] = format 4 ptr
+        push    qword 0                  ; [rsp+0] = format 12 ptr
+
         xor     ebx, ebx
-        xor     r15, r15                 ; will hold chosen subtable abs ptr (0 = none)
-        push    r15                      ; reserve [rsp] = chosen_ptr (avoid using r15 across calls)
 .loop:
         cmp     ebx, r13d
         jge     .done
 
-        ; platformID
+        ; platformID / encodingID / subtableOffset
         mov     rdi, r14
         call    be_u16
         mov     ecx, eax                 ; ecx = platformID
-
-        ; encodingID
         lea     rdi, [r14 + 2]
         call    be_u16
         mov     edx, eax                 ; edx = encodingID
-
-        ; subtableOffset
         lea     rdi, [r14 + 4]
         call    be_u32
-        ; rax = offset from cmap base
-        lea     rdi, [r12 + rax]         ; rdi = subtable absolute pointer
+        lea     rdi, [r12 + rax]         ; rdi = subtable abs ptr
 
-        ; check format
         push    rdi
         call    be_u16                   ; rax = format
         pop     rdi
-        cmp     eax, 4
-        jne     .skip
 
-        ; accept (3,1) immediately; (0,*) acceptable as fallback
+        cmp     eax, 12
+        je      .check_fmt12
+        cmp     eax, 4
+        je      .check_fmt4
+        jmp     .skip
+
+.check_fmt12:
+        ; Format 12: accept (3,10), (0,4), (0,6).
         cmp     ecx, 3
-        jne     .try_uni
-        cmp     edx, 1
+        jne     .fmt12_try_uni
+        cmp     edx, 10
         jne     .skip
-        mov     [rsp], rdi
-        jmp     .done                    ; preferred match — stop
-.try_uni:
+        mov     [rsp], rdi               ; preferred — set & continue (might find better never matters)
+        jmp     .skip
+.fmt12_try_uni:
         cmp     ecx, 0
         jne     .skip
-        ; only set if no preferred chosen yet
-        cmp     qword [rsp], 0
+        cmp     edx, 4
+        je      .fmt12_set_uni
+        cmp     edx, 6
         jne     .skip
+.fmt12_set_uni:
+        cmp     qword [rsp], 0
+        jne     .skip                    ; already have a fmt12 (might be the (3,10))
         mov     [rsp], rdi
+        jmp     .skip
+
+.check_fmt4:
+        ; Format 4: accept (3,1) > (0,*).
+        cmp     ecx, 3
+        jne     .fmt4_try_uni
+        cmp     edx, 1
+        jne     .skip
+        mov     [rsp + 8], rdi
+        jmp     .skip
+.fmt4_try_uni:
+        cmp     ecx, 0
+        jne     .skip
+        cmp     qword [rsp + 8], 0
+        jne     .skip
+        mov     [rsp + 8], rdi
 .skip:
         add     r14, 8
         inc     ebx
         jmp     .loop
 
 .done:
-        mov     rax, [rsp]
-        add     rsp, 8
+        ; Prefer format 12 if we have one.
+        mov     rax, [rsp]               ; fmt12 ptr
+        test    rax, rax
+        jnz     .have_fmt12
+
+        mov     rax, [rsp + 8]           ; fmt4 ptr
+        add     rsp, 16                  ; pop both stack slots
         test    rax, rax
         jz      .fail
+        ; ---- format 4 setup ----
         mov     [cmap_subtable_ptr], rax
-
+        mov     qword [cmap_format], 4
         ; subtable layout (format 4):
-        ;   u16 format (0)
-        ;   u16 length (2)
-        ;   u16 language (4)
-        ;   u16 segCountX2 (6)
-        ;   u16 searchRange (8), entrySelector (10), rangeShift (12)
-        ;   u16 endCode[segCount] (14)
-        ;   u16 reservedPad
-        ;   u16 startCode[segCount]
-        ;   i16 idDelta[segCount]
-        ;   u16 idRangeOffset[segCount]
-        ;   u16 glyphIdArray[]
+        ;   u16 format (0), u16 length (2), u16 language (4)
+        ;   u16 segCountX2 (6), …, u16 endCode[segCount] (14), …
         mov     rdi, rax
         add     rdi, 6
-        push    rax                      ; preserve subtable base
-        call    be_u16                   ; segCountX2
+        push    rax
+        call    be_u16
         shr     eax, 1
         mov     [cmap_segCount], rax
-        mov     rcx, rax                 ; rcx = segCount
-
-        pop     rax                      ; rax = subtable base
-        lea     rbx, [rax + 14]          ; endCode
+        mov     rcx, rax
+        pop     rax
+        lea     rbx, [rax + 14]
         mov     [cmap_endCode_ptr], rbx
-
-        ; startCode = endCode + segCount*2 + 2 (reservedPad)
         lea     rbx, [rbx + rcx*2]
         add     rbx, 2
         mov     [cmap_startCode_ptr], rbx
-
-        ; idDelta = startCode + segCount*2
         lea     rbx, [rbx + rcx*2]
         mov     [cmap_idDelta_ptr], rbx
-
-        ; idRangeOffset = idDelta + segCount*2
         lea     rbx, [rbx + rcx*2]
         mov     [cmap_idRangeOffset_ptr], rbx
-
         xor     eax, eax
         jmp     .ret
+
+.have_fmt12:
+        ; ---- format 12 setup ----
+        ;   u16 format (0)
+        ;   u16 reserved (2)
+        ;   u32 length (4)
+        ;   u32 language (8)
+        ;   u32 numGroups (12)
+        ;   SequentialMapGroup[numGroups] starting at +16:
+        ;       u32 startCharCode
+        ;       u32 endCharCode
+        ;       u32 startGlyphID
+        add     rsp, 16                  ; pop both stack slots
+        mov     [cmap_subtable_ptr], rax
+        mov     qword [cmap_format], 12
+        push    rax
+        lea     rdi, [rax + 12]
+        call    be_u32
+        mov     [cmap_fmt12_numgroups], rax
+        pop     rax
+        add     rax, 16
+        mov     [cmap_fmt12_groups_ptr], rax
+        xor     eax, eax
+        jmp     .ret
+
 .fail:
         mov     eax, 1
 .ret:
@@ -2698,8 +2757,13 @@ find_cmap_format4:
 
 ; ---------------------------------------------------------------------
 ; cmap_lookup — rdi = codepoint, returns rax = glyph_id (0 = .notdef).
-; Linear scan over segments (segCount typically <300, fine for MVP).
+; Dispatches on cmap_format: format 12 (sequential groups, full
+; Unicode) or format 4 (BMP segmented).
 cmap_lookup:
+        cmp     qword [cmap_format], 12
+        je      cmap_lookup_fmt12
+        ; falls through to format 4 (default / legacy)
+cmap_lookup_fmt4:
         push    rbx
         push    r12
         push    r13
@@ -2707,6 +2771,11 @@ cmap_lookup:
         push    r15
 
         mov     r12, rdi                 ; r12 = codepoint
+        ; Format 4 only stores BMP codepoints; cp > 0xFFFF is a guaranteed
+        ; miss (and idDelta wraparound math would alias bad gids).
+        cmp     r12, 0xFFFF
+        ja      .notdef
+
         mov     rcx, [cmap_segCount]
         mov     r13, rcx                 ; r13 = segCount
         xor     ebx, ebx                 ; ebx = i
@@ -2773,6 +2842,65 @@ cmap_lookup:
 .notdef:
         xor     eax, eax
 .ret:
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; cmap_lookup_fmt12 — sequential-group lookup over the format 12
+; subtable. Each SequentialMapGroup is 12 bytes:
+;   u32 startCharCode, u32 endCharCode, u32 startGlyphID
+; Linear scan; numGroups is small (≤ a few hundred for the largest
+; Unicode fonts). Could binary-search if hot.
+;   rdi = codepoint (full 32-bit), returns rax = glyph_id (0 = miss).
+cmap_lookup_fmt12:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+
+        mov     r12, rdi                 ; r12 = codepoint
+        mov     r13, [cmap_fmt12_numgroups]
+        mov     r14, [cmap_fmt12_groups_ptr]
+        xor     rbx, rbx                 ; group index (use full rbx, not ebx)
+
+.f12_loop:
+        cmp     rbx, r13                 ; full 64-bit compare (counts up to 256)
+        jae     .f12_notdef              ; UNSIGNED >=
+        ; group base = groups_ptr + i*12
+        mov     rax, rbx
+        imul    rax, rax, 12
+        lea     r15, [r14 + rax]         ; r15 = &group[i]
+        ; startCharCode (u32 BE)
+        mov     rdi, r15
+        call    be_u32
+        mov     r10, rax                 ; r10 = startCharCode (preserve across be_u32)
+        cmp     r12, r10
+        jb      .f12_next                ; cp < startCharCode (UNSIGNED)
+        ; endCharCode
+        lea     rdi, [r15 + 4]
+        call    be_u32
+        cmp     r12, rax
+        ja      .f12_next                ; cp > endCharCode (UNSIGNED)
+        ; Match — startGlyphID
+        lea     rdi, [r15 + 8]
+        call    be_u32
+        ; gid = startGlyphID + (cp - startCharCode)
+        mov     rcx, r12
+        sub     rcx, r10
+        add     rax, rcx
+        jmp     .f12_ret
+.f12_next:
+        inc     rbx
+        jmp     .f12_loop
+
+.f12_notdef:
+        xor     eax, eax
+.f12_ret:
         pop     r15
         pop     r14
         pop     r13
