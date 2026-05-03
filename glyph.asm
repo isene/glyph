@@ -146,6 +146,9 @@ tag_glyf:       db "glyf"
 tag_fvar:       db "fvar"
 tag_gvar:       db "gvar"
 tag_avar:       db "avar"
+; color bitmaps (Noto Color Emoji + similar)
+tag_CBLC:       db "CBLC"
+tag_CBDT:       db "CBDT"
 ; variation axis tags
 tag_wght:       db "wght"
 
@@ -212,6 +215,23 @@ tbl_gvar_off:   resq 1
 tbl_gvar_len:   resq 1
 tbl_avar_off:   resq 1
 tbl_avar_len:   resq 1
+tbl_CBLC_off:   resq 1          ; color bitmap location locator
+tbl_CBLC_len:   resq 1
+tbl_CBDT_off:   resq 1          ; color bitmap data
+tbl_CBDT_len:   resq 1
+
+; ---- CBDT/CBLC parsed strike state (zero unless both tables present) ----
+; A "strike" is a fixed-pixel-size set of color bitmaps. We pick the
+; biggest strike at font load (most fonts ship one; Noto Color Emoji
+; ships a single 136 ppem strike). The strike's indexSubTableArray gives
+; us per-glyph offsets into CBDT for PNG bytes.
+cbx_active:             resq 1          ; 1 if a usable strike was found
+cbx_index_array_ptr:    resq 1          ; absolute ptr to indexSubTableArray
+cbx_num_index_subtables: resq 1         ; how many entries in that array
+cbx_ppem:               resq 1          ; pixels-per-em of chosen strike
+cbx_start_glyph:        resq 1          ; bitmapSize.startGlyphIndex
+cbx_end_glyph:          resq 1          ; bitmapSize.endGlyphIndex
+cbx_cbdt_base:          resq 1          ; absolute ptr to CBDT body
 
 ; ---- variable-font state (zero unless fvar present) ----
 fvar_axis_count:        resq 1
@@ -708,10 +728,12 @@ glyph_load_font:
         je      .e_table
         cmp     qword [tbl_cmap_off], 0
         je      .e_table
-        cmp     qword [tbl_glyf_off], 0
-        je      .e_table
-        cmp     qword [tbl_loca_off], 0
-        je      .e_table
+        ; loca + glyf are required for outline rendering (the
+        ; glyph_render_to_alpha path) but absent in color-bitmap-only
+        ; fonts like NotoColorEmoji.ttf which ship CBDT/CBLC instead.
+        ; Allow such fonts to load — the consumer must use
+        ; glyph_color_bitmap_for_cp not glyph_render_to_alpha; the
+        ; latter would fault in loca_lookup.
 
         call    parse_head
         call    parse_maxp
@@ -723,6 +745,10 @@ glyph_load_font:
         call    find_cmap_subtable
         test    rax, rax
         jnz     .e_cmap
+
+        ; Color-bitmap strike (Noto Color Emoji etc.) — optional; absence
+        ; just means glyph_color_bitmap_for_cp returns 0 for every cp.
+        call    parse_cblc
 
         xor     eax, eax
         pop     rbx
@@ -1260,8 +1286,16 @@ parse_sfnt:
         lea     rdi, [tbl_gvar_off]
         jmp     .store
 .t9:    cmp     eax, [tag_avar]
-        jne     .next
+        jne     .t10
         lea     rdi, [tbl_avar_off]
+        jmp     .store
+.t10:   cmp     eax, [tag_CBLC]
+        jne     .t11
+        lea     rdi, [tbl_CBLC_off]
+        jmp     .store
+.t11:   cmp     eax, [tag_CBDT]
+        jne     .next
+        lea     rdi, [tbl_CBDT_off]
 
 .store:
         mov     eax, [r14 + 8]
@@ -2906,6 +2940,280 @@ cmap_lookup_fmt12:
         pop     r13
         pop     r12
         pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; parse_cblc — parse the CBLC table to locate a usable color-bitmap
+; strike. Picks the BIGGEST strike (max ppemY) — for Noto Color Emoji
+; that's the only one (109 ppem); fonts that ship multiple strikes get
+; the one nearest the cell at runtime via downscale.
+;
+; CBLC layout:
+;   header (8 bytes):
+;     u32 majorVersion (high 16) + u32 minorVersion (low 16)
+;     u32 numSizes
+;   bitmapSize[numSizes] (each 48 bytes):
+;     u32  indexSubTableArrayOffset (from CBLC base)
+;     u32  indexTablesSize
+;     u32  numberOfIndexSubTables
+;     u32  colorRef
+;     12B  sbitLineMetrics horiz
+;     12B  sbitLineMetrics vert
+;     u16  startGlyphIndex
+;     u16  endGlyphIndex
+;     u8   ppemX, ppemY, bitDepth
+;     i8   flags
+;
+; Sets cbx_active=1 + the cbx_* fields on success; leaves cbx_active=0
+; otherwise.
+parse_cblc:
+        mov     qword [cbx_active], 0
+        cmp     qword [tbl_CBLC_off], 0
+        je      .pc_ret
+        cmp     qword [tbl_CBDT_off], 0
+        je      .pc_ret
+
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+
+        mov     r12, [font_base]
+        add     r12, [tbl_CBLC_off]      ; r12 = CBLC base
+        mov     rax, [font_base]
+        add     rax, [tbl_CBDT_off]
+        mov     [cbx_cbdt_base], rax
+
+        ; numSizes (u32 BE at +4)
+        lea     rdi, [r12 + 4]
+        call    be_u32
+        test    rax, rax
+        jz      .pc_done
+        mov     r13, rax                 ; r13 = numSizes
+
+        lea     r14, [r12 + 8]           ; r14 = first bitmapSize record
+        xor     rbx, rbx                 ; index
+        xor     r15, r15                 ; best ppem so far
+
+.pc_loop:
+        cmp     rbx, r13
+        jae     .pc_done
+        ; Read ppemY at offset 45 of the record.
+        movzx   eax, byte [r14 + 45]
+        cmp     rax, r15
+        jbe     .pc_skip
+        ; New best — capture this strike.
+        mov     r15, rax                 ; new best ppem
+        mov     [cbx_ppem], rax
+        ; indexSubTableArrayOffset (+0)
+        mov     rdi, r14
+        call    be_u32
+        add     rax, r12                 ; absolute ptr
+        mov     [cbx_index_array_ptr], rax
+        ; numberOfIndexSubTables (+8)
+        lea     rdi, [r14 + 8]
+        call    be_u32
+        mov     [cbx_num_index_subtables], rax
+        ; startGlyphIndex (u16 BE at +40)
+        movzx   eax, byte [r14 + 40]
+        shl     eax, 8
+        movzx   ecx, byte [r14 + 41]
+        or      eax, ecx
+        mov     [cbx_start_glyph], rax
+        ; endGlyphIndex (u16 BE at +42)
+        movzx   eax, byte [r14 + 42]
+        shl     eax, 8
+        movzx   ecx, byte [r14 + 43]
+        or      eax, ecx
+        mov     [cbx_end_glyph], rax
+        mov     qword [cbx_active], 1
+.pc_skip:
+        add     r14, 48
+        inc     rbx
+        jmp     .pc_loop
+
+.pc_done:
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+.pc_ret:
+        ret
+
+; ---------------------------------------------------------------------
+; glyph_color_bitmap_for_cp — look up the PNG bytes for a codepoint in
+; the active font's color-bitmap strike.
+;   in : rdi = codepoint (full Unicode)
+;   out: rax = absolute pointer to first PNG byte, or 0 if no bitmap
+;        rcx = PNG byte length (only meaningful if rax != 0)
+;
+; Walks the indexSubTableArray to find the entry whose
+; [firstGlyphIndex, lastGlyphIndex] range contains gid; reads the
+; indexSubtable header to get format + imageDataOffset; reads the
+; per-glyph offset (format 1 = u32, format 3 = u16); finally reads the
+; PNG length + bytes from CBDT[imageDataOffset + offset].
+;
+; Supported imageFormat values: 17 (smallGlyphMetrics+PNG, Noto Color
+; Emoji uses this) and 18 (bigGlyphMetrics+PNG). Format 19 (just PNG,
+; no metrics) currently unsupported (hits return 0 → emoji renders via
+; fallback path).
+glyph_color_bitmap_for_cp:
+        cmp     qword [cbx_active], 0
+        je      .gcb_miss
+
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        push    rbp
+
+        ; cmap → glyph id
+        ; rdi already holds the codepoint per the public contract.
+        call    cmap_lookup
+        test    rax, rax
+        jz      .gcb_no_gid
+        mov     r12, rax                 ; r12 = gid
+
+        ; gid in [start, end] range?
+        cmp     r12, [cbx_start_glyph]
+        jb      .gcb_no_gid
+        cmp     r12, [cbx_end_glyph]
+        ja      .gcb_no_gid
+
+        ; Walk indexSubTableArray. Each entry is 8 bytes:
+        ;   u16 firstGlyphIndex
+        ;   u16 lastGlyphIndex
+        ;   u32 additionalOffsetToIndexSubtable (from indexSubTableArray base)
+        mov     r13, [cbx_index_array_ptr]
+        mov     r14, [cbx_num_index_subtables]
+        xor     rbx, rbx
+.gcb_array_loop:
+        cmp     rbx, r14
+        jae     .gcb_no_gid
+        mov     rax, rbx
+        imul    rax, 8
+        lea     r15, [r13 + rax]         ; entry pointer
+        ; firstGlyphIndex (u16 BE)
+        movzx   eax, byte [r15]
+        shl     eax, 8
+        movzx   ecx, byte [r15 + 1]
+        or      eax, ecx
+        mov     rbp, rax                 ; rbp = first
+        cmp     r12, rbp
+        jb      .gcb_array_next
+        ; lastGlyphIndex (u16 BE)
+        movzx   eax, byte [r15 + 2]
+        shl     eax, 8
+        movzx   ecx, byte [r15 + 3]
+        or      eax, ecx
+        cmp     r12, rax
+        ja      .gcb_array_next
+        ; Match. additionalOffsetToIndexSubtable at +4 (u32 BE) → subtable.
+        lea     rdi, [r15 + 4]
+        call    be_u32
+        add     rax, r13                 ; abs ptr to indexSubtable
+        mov     r15, rax                 ; r15 = subtable header
+        ; indexSubHeader:
+        ;   u16 indexFormat (offset 0)
+        ;   u16 imageFormat (offset 2)
+        ;   u32 imageDataOffset (offset 4) — relative to CBDT base
+        movzx   eax, byte [r15]
+        shl     eax, 8
+        movzx   ecx, byte [r15 + 1]
+        or      eax, ecx
+        mov     r14, rax                 ; r14 = indexFormat
+        movzx   eax, byte [r15 + 2]
+        shl     eax, 8
+        movzx   ecx, byte [r15 + 3]
+        or      eax, ecx
+        mov     r13, rax                 ; r13 = imageFormat (17, 18, or 19)
+        cmp     r13, 17
+        je      .gcb_fmt_ok
+        cmp     r13, 18
+        je      .gcb_fmt_ok
+        jmp     .gcb_no_gid              ; unsupported imageFormat
+.gcb_fmt_ok:
+        lea     rdi, [r15 + 4]
+        call    be_u32
+        add     rax, [cbx_cbdt_base]     ; abs ptr to imageData base for this subtable
+        mov     rcx, rax                 ; rcx = imageDataBase
+        ; gid - firstGlyphIndex
+        mov     rax, r12
+        sub     rax, rbp                 ; rax = local index
+        ; Per-glyph offset depends on indexFormat:
+        ;   format 1: offsets[N+1] each u32, so subtable[8 + idx*4] = u32 BE
+        ;   format 3: offsets[N+1] each u16, so subtable[8 + idx*2] = u16 BE
+        cmp     r14, 1
+        je      .gcb_idx_fmt1
+        cmp     r14, 3
+        je      .gcb_idx_fmt3
+        jmp     .gcb_no_gid              ; unsupported indexFormat
+.gcb_idx_fmt1:
+        mov     rdx, rax
+        shl     rdx, 2                   ; idx * 4
+        lea     rdi, [r15 + 8]
+        add     rdi, rdx
+        call    be_u32
+        jmp     .gcb_have_offset
+.gcb_idx_fmt3:
+        mov     rdx, rax
+        shl     rdx, 1                   ; idx * 2
+        lea     rdi, [r15 + 8]
+        add     rdi, rdx
+        movzx   eax, byte [rdi]
+        shl     eax, 8
+        movzx   edx, byte [rdi + 1]
+        or      eax, edx
+.gcb_have_offset:
+        ; rax = byte offset within the per-subtable image data block.
+        ; Final glyph data abs ptr = imageDataBase + rax.
+        add     rax, rcx                 ; rax = ptr to glyph entry
+        ; Format 17: skip 5 bytes of SmallGlyphMetrics, then read u32
+        ;            dataLen, then PNG bytes.
+        ; Format 18: skip 8 bytes of BigGlyphMetrics, then u32 dataLen,
+        ;            then PNG bytes.
+        cmp     r13, 17
+        jne     .gcb_fmt18
+        add     rax, 5
+        jmp     .gcb_read_len
+.gcb_fmt18:
+        add     rax, 8
+.gcb_read_len:
+        mov     rdi, rax
+        call    be_u32
+        mov     rcx, rax                 ; rcx = PNG length
+        mov     rax, rdi
+        add     rax, 4                   ; skip the length field → PNG bytes
+        ; rax = PNG ptr, rcx = PNG length
+        pop     rbp
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+.gcb_array_next:
+        inc     rbx
+        jmp     .gcb_array_loop
+
+.gcb_no_gid:
+        xor     eax, eax
+        xor     ecx, ecx
+        pop     rbp
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+.gcb_miss:
+        xor     eax, eax
+        xor     ecx, ecx
         ret
 
 ; ---------------------------------------------------------------------
