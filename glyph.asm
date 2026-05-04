@@ -536,7 +536,7 @@ _start:
         mov     [str_baseline_fix], rax
 
         ; iterate string: parse outline + transform + accumulate edges
-        xor     rbx, rbx
+        xor ebx, ebx
 .s_loop:
         cmp     rbx, [str_len]
         jge     .s_done
@@ -566,8 +566,8 @@ _start:
         movsxd  rax, dword [str_glyph_ids + rbx*4]
         mov     rdi, rax
         push    rbx
-        xor     rsi, rsi                  ; start_pts = 0
-        xor     rdx, rdx                  ; start_contours = 0
+        xor esi, esi                  ; start_pts = 0
+        xor edx, edx                  ; start_contours = 0
         call    apply_gvar_to_simple
         pop     rbx
 .s_no_gvar:
@@ -899,7 +899,7 @@ apply_post_process:
         mov     r13, [img_H]
         test    r13, r13
         jz      .pp_after_bold
-        xor     rcx, rcx                  ; row counter
+        xor ecx, ecx                  ; row counter
 .pp_b_row:
         cmp     rcx, r13
         jge     .pp_after_bold
@@ -940,7 +940,7 @@ apply_post_process:
         jz      .pp_done
         cmp     r12, MAX_OUT_DIM
         ja      .pp_done                   ; tmp buffer can't hold row
-        xor     rcx, rcx                  ; row counter
+        xor ecx, ecx                  ; row counter
 .pp_o_row:
         cmp     rcx, r13
         jge     .pp_done
@@ -992,7 +992,7 @@ apply_post_process:
         imul    rax, r12
         lea     r10, [output_buf]
         add     r10, rax                  ; row base
-        xor     rbx, rbx                  ; x = 0
+        xor ebx, ebx                  ; x = 0
 .pp_o_blit_col:
         cmp     rbx, r12
         jge     .pp_o_row_done
@@ -1069,8 +1069,8 @@ glyph_render_to_alpha:
         test    rax, rax
         js      .skip_outer_gvar
         mov     rdi, [glyph_id]
-        xor     rsi, rsi
-        xor     rdx, rdx
+        xor esi, esi
+        xor edx, edx
         call    apply_gvar_to_simple
 .skip_outer_gvar:
 
@@ -1168,10 +1168,10 @@ glyph_render_to_alpha:
         ; Empty glyph (space etc.): zero-size bitmap, advance = hmtx
         mov     qword [img_W], 0
         mov     qword [img_H], 0
-        xor     rcx, rcx
-        xor     rdx, rdx
-        xor     r8, r8
-        xor     r9, r9
+        xor ecx, ecx
+        xor edx, edx
+        xor r8d, r8d
+        xor r9d, r9d
         mov     rdi, [glyph_id]
         call    hmtx_advance
         imul    rax, [arg_size]
@@ -1676,7 +1676,6 @@ compute_norm_coord:
         shl     rax, 14
         mov     rcx, [fvar_wght_max]
         sub     rcx, [fvar_wght_default]
-        test    rcx, rcx
         jz      .ret
         cqo
         idiv    rcx
@@ -1688,7 +1687,6 @@ compute_norm_coord:
         shl     rax, 14
         mov     rcx, [fvar_wght_default]
         sub     rcx, [fvar_wght_min]
-        test    rcx, rcx
         jz      .ret
         cqo
         idiv    rcx
@@ -1861,7 +1859,7 @@ gv_decode_points:
         inc     rdi
         mov     rcx, [_gv_npts_glyph]
         mov     [_gv_pts_n], rcx
-        xor     rbx, rbx
+        xor ebx, ebx
 .fa:
         cmp     rbx, rcx
         jge     .fa_done
@@ -1876,8 +1874,8 @@ gv_decode_points:
         mov     [_gv_pts_n], rax
         mov     r14, rax                 ; total
 
-        xor     r12, r12                 ; running point number
-        xor     r13, r13                 ; emitted index
+        xor r12d, r12d                 ; running point number
+        xor r13d, r13d                 ; emitted index
 .runs:
         cmp     r13, r14
         jge     .ret
@@ -1941,7 +1939,7 @@ gv_decode_deltas:
 
         mov     r12, rsi                 ; output ptr
         mov     r13, [_gv_pts_n]         ; total
-        xor     r14, r14                 ; emitted
+        xor r14d, r14d                 ; emitted
 
 .runs:
         cmp     r14, r13
@@ -2044,7 +2042,7 @@ gv_compute_scalar:
         cmp     qword [_gv_have_intermediate], 0
         jne     .explicit_int
         ; default region: intStart = 0, intEnd = sign(peak) * 16384
-        xor     rdx, rdx                  ; intStart
+        xor edx, edx                  ; intStart
         mov     r12, 16384                ; intEnd magnitude
         test    rbx, rbx
         jns     .ie_set
@@ -2097,7 +2095,6 @@ gv_compute_scalar:
         shl     rax, 14
         mov     rdi, r12
         sub     rdi, rbx
-        test    rdi, rdi
         jz      .zero
         cqo
         idiv    rdi
@@ -2121,7 +2118,6 @@ gv_compute_scalar:
         shl     rax, 14
         mov     rdi, rbx
         sub     rdi, rdx
-        test    rdi, rdi
         jz      .zero
         cqo
         idiv    rdi
@@ -2167,7 +2163,7 @@ iup_axis:
         jl      .ret
 
         ; Any touched in this contour?
-        xor     rbx, rbx
+        xor ebx, ebx
 .has_loop:
         cmp     rbx, rbp
         jge     .ret
@@ -2179,7 +2175,7 @@ iup_axis:
         jmp     .has_loop
 
 .iter_init:
-        xor     rbx, rbx
+        xor ebx, ebx
 .iter:
         cmp     rbx, rbp
         jge     .ret
@@ -2210,7 +2206,7 @@ iup_axis:
         inc     rcx
         cmp     rcx, rbp
         jl      .check_R
-        xor     rcx, rcx
+        xor ecx, ecx
 .check_R:
         cmp     rcx, rbx
         je      .single_with_L
@@ -2373,7 +2369,7 @@ apply_gvar_to_simple:
         ; copy _gv_pts -> _gv_shared
         mov     rcx, [_gv_pts_n]
         mov     [_gv_shared_n], rcx
-        xor     rbx, rbx
+        xor ebx, ebx
 .cs:
         cmp     rbx, rcx
         jge     .cs_done
@@ -2458,7 +2454,7 @@ apply_gvar_to_simple:
         ; copy _gv_shared -> _gv_pts
         mov     rcx, [_gv_shared_n]
         mov     [_gv_pts_n], rcx
-        xor     rdx, rdx
+        xor edx, edx
 .cp_sh:
         cmp     rdx, rcx
         jge     .cp_sh_done
@@ -2513,7 +2509,7 @@ apply_gvar_to_simple:
         push    rcx                       ; keep npts_this on stack for fill bound
 
         ; Fill from explicit deltas (skip phantom & out-of-range indices).
-        xor     rdx, rdx
+        xor edx, edx
 .fill_loop:
         cmp     rdx, [_gv_pts_n]
         jge     .fill_done
@@ -2904,7 +2900,7 @@ cmap_lookup_fmt12:
         mov     r12, rdi                 ; r12 = codepoint
         mov     r13, [cmap_fmt12_numgroups]
         mov     r14, [cmap_fmt12_groups_ptr]
-        xor     rbx, rbx                 ; group index (use full rbx, not ebx)
+        xor ebx, ebx                 ; group index (use full rbx, not ebx)
 
 .f12_loop:
         cmp     rbx, r13                 ; full 64-bit compare (counts up to 256)
@@ -2997,8 +2993,8 @@ parse_cblc:
         mov     r13, rax                 ; r13 = numSizes
 
         lea     r14, [r12 + 8]           ; r14 = first bitmapSize record
-        xor     rbx, rbx                 ; index
-        xor     r15, r15                 ; best ppem so far
+        xor ebx, ebx                 ; index
+        xor r15d, r15d                 ; best ppem so far
 
 .pc_loop:
         cmp     rbx, r13
@@ -3093,7 +3089,7 @@ glyph_color_bitmap_for_cp:
         ;   u32 additionalOffsetToIndexSubtable (from indexSubTableArray base)
         mov     r13, [cbx_index_array_ptr]
         mov     r14, [cbx_num_index_subtables]
-        xor     rbx, rbx
+        xor ebx, ebx
 .gcb_array_loop:
         cmp     rbx, r14
         jae     .gcb_no_gid
@@ -3451,7 +3447,7 @@ parse_simple_into:
 
         add     r12, 10
 
-        xor     rbx, rbx
+        xor ebx, ebx
 .ep_loop:
         cmp     rbx, [_ps_nc]
         jge     .ep_done
@@ -3489,7 +3485,7 @@ parse_simple_into:
         add     r12, rax
 
         ; flags (with REPEAT) -> pt_flags[r13 + i]
-        xor     rbx, rbx
+        xor ebx, ebx
 .fl_loop:
         cmp     rbx, [_ps_npts]
         jge     .fl_done
@@ -3518,7 +3514,7 @@ parse_simple_into:
 
         ; xCoords -> pt_x[r13 + i], accumulator starts at dx
         mov     r9, r15
-        xor     rbx, rbx
+        xor ebx, ebx
 .xc_loop:
         cmp     rbx, [_ps_npts]
         jge     .xc_done
@@ -3558,7 +3554,7 @@ parse_simple_into:
 
         ; yCoords -> pt_y[r13 + i], accumulator starts at dy
         mov     r9, rbp
-        xor     rbx, rbx
+        xor ebx, ebx
 .yc_loop:
         cmp     rbx, [_ps_npts]
         jge     .yc_done
@@ -3667,8 +3663,8 @@ parse_composite_into:
         ; ARGS_ARE_XY_VALUES → use as offset; else point matching (skip)
         test    r13, CF_ARGS_ARE_XY_VALUES
         jnz     .have_xy
-        xor     r15, r15
-        xor     rbp, rbp
+        xor r15d, r15d
+        xor ebp, ebp
 .have_xy:
 
         ; Skip optional transform bytes (we don't apply scale yet).
@@ -4203,8 +4199,8 @@ generate_edges:
         mov     r15, [out_numContours]
         test    r15, r15
         jz      .all_done
-        xor     r12, r12                 ; r12 = contour index
-        xor     r13, r13                 ; r13 = first point index of current contour
+        xor r12d, r12d                 ; r12 = contour index
+        xor r13d, r13d                 ; r13 = first point index of current contour
 .c_loop:
         cmp     r12, r15
         jge     .all_done
@@ -4471,15 +4467,15 @@ rasterize:
         push    r14
         push    r15
 
-        xor     r12, r12                 ; y = 0
+        xor r12d, r12d                 ; y = 0
         mov     r13, [img_bigH]
 .y_loop:
         cmp     r12, r13
         jge     .y_done
 
         ; collect intersections for scanline y
-        xor     r14, r14                 ; intersection count
-        xor     rbx, rbx                 ; edge index
+        xor r14d, r14d                 ; intersection count
+        xor ebx, ebx                 ; edge index
         mov     r15, [e_count]
 .e_loop:
         cmp     rbx, r15
@@ -4535,7 +4531,7 @@ rasterize:
 .s_done:
 
         ; NZW fill
-        xor     rcx, rcx                 ; intersection iterator
+        xor ecx, ecx                 ; intersection iterator
         xor     r10d, r10d               ; winding sum (in r10 — rdi gets clobbered by stosb)
         xor     ebp, ebp                 ; prev_x int (only valid when inside)
 .f_loop:
@@ -4607,16 +4603,16 @@ box_filter:
         mov     r13, [img_H]
         mov     r14, [img_bigW]
 
-        xor     r15, r15                 ; oy
+        xor r15d, r15d                 ; oy
 .oy_loop:
         cmp     r15, r13
         jge     .done
-        xor     rbx, rbx                 ; ox
+        xor ebx, ebx                 ; ox
 .ox_loop:
         cmp     rbx, r12
         jge     .ox_done
         xor     edi, edi                 ; sum
-        xor     rcx, rcx                 ; sy
+        xor ecx, ecx                 ; sy
 .sy_loop:
         cmp     rcx, SS
         jge     .sy_done
@@ -4945,8 +4941,8 @@ string_prepass:
         div     qword [head_unitsPerEm]
         mov     r13, rax                 ; r13 = scaleFix
 
-        xor     r14, r14                 ; pen_x_fix accumulator (16.16 big-pixel)
-        xor     r15, r15                 ; index
+        xor r14d, r14d                 ; pen_x_fix accumulator (16.16 big-pixel)
+        xor r15d, r15d                 ; index
 .l:
         ; UTF-8 decode at [r12 + ...]; advance r12 past the consumed bytes.
         ; rax = codepoint, 0 = end.
@@ -5062,7 +5058,7 @@ dump_edges_debug:
         push    rbx
         push    r12
         mov     r12, [e_count]
-        xor     rbx, rbx
+        xor ebx, ebx
 .l:
         cmp     rbx, r12
         jge     .d
