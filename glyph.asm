@@ -154,14 +154,18 @@ tag_wght:       db "wght"
 
 ; ---------------------------------------------------------------------
 ; Gamma LUT — coverage-bin (0..16, since SS=4 → 16 samples per pixel) to
-; perceptual alpha (0..255). Maps linear coverage through gamma γ ≈ 1.43
-; (alpha = 255·cov^0.7), matching FreeType's default "stem darkening"
-; correction for sRGB displays. Without it, mid-coverage (8/16) maps to
-; alpha 128 — which a 2.2-gamma monitor displays at ~22% perceived
-; brightness, making anti-aliased text look thin and pale. With
-; γ-correction, 50%-cov pixels emit alpha 148 → ~31% perceived → bolder,
-; closer to what FreeType+XRender produces for kitty.
-gamma_lut:      db 0, 35, 56, 74, 91, 106, 120, 134, 148, 161, 174, 186, 199, 211, 222, 234, 255
+; perceptual alpha (0..255). alpha = 255·cov^0.5 (sqrt curve, γ ≈ 2.0),
+; tuned for sRGB displays where the framebuffer→light path follows a
+; ~2.2 gamma. Without compensation, naive linear alpha at cov=0.5 emits
+; α=128 which the monitor displays at ~22% perceived brightness — thin
+; gray stems. The sqrt curve emits α=180 at cov=0.5 (~50% perceived),
+; which matches kitty / FreeType + LCD-aware compositors much more
+; closely. Older curve (γ=1.43, α=148 mid) was an under-correction.
+;
+; This is glyph's stem-darkening pass; it's a global per-pixel boost,
+; not per-feature like FreeType's, but for monospace terminal text the
+; perceived effect is similar and the code stays small.
+gamma_lut:      db 0, 64, 90, 110, 128, 143, 156, 169, 180, 191, 202, 211, 221, 230, 239, 247, 255
 
 ; ---------------------------------------------------------------------
 section .bss
