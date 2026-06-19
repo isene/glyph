@@ -2,7 +2,7 @@
 
 <img src="img/glyph.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.4.9-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~37KB-orange) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.5.0-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~47KB-orange) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 TrueType font rasterizer written in x86_64 Linux assembly. No libc, no
 runtime, no FreeType, no harfbuzz. Pure syscalls. Single static binary,
@@ -71,6 +71,30 @@ silently ignored. Default = the axis's declared default value (usually
 
 Codepoint mode dispatches when the second argument starts with a digit;
 otherwise it's treated as a UTF-8 string.
+
+### Font picker backend
+
+For tools that want to populate a font picker (e.g. scribe), glyph
+exposes two explicit flags. Same binary, no extra dependencies.
+
+```bash
+# Enumerate fonts: read paths from stdin, write "path\tfamily\tstyle\n"
+find /usr/share/fonts ~/.fonts ~/.local/share/fonts \
+  -type f \( -iname '*.ttf' -o -iname '*.otf' \) 2>/dev/null \
+  | glyph --list
+
+# Render a preview, natural argument order
+glyph --preview FONT.ttf SIZE 'Sample text' > preview.pgm
+```
+
+`--list` parses only the SFNT `name` table — it skips the rasterizer
+entirely, so a typical 800-font system enumerates in ~30 ms in a single
+process (no per-font fork+exec). It prefers Windows Unicode US-English
+name records and falls back to Mac Roman; non-ASCII characters in
+family names are stripped (the path is the disambiguator).
+
+`--preview` is the existing string-render path with `SIZE` before
+`TEXT` for readability when wired into a TUI.
 
 ## How It Works
 

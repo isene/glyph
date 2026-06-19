@@ -301,6 +301,18 @@ str_total_W:            resq 1
 str_glyph_ids:          resd MAX_STR_GLYPHS
 str_pen_x_fix:          resd MAX_STR_GLYPHS
 str_baseline_fix:       resq 1
+arg_string_ptr:         resq 1          ; argv[2] for old CLI, argv[4] for --preview
+; ---- --list mode (stdin-driven batch font name extraction) ----
+list_stdin_buf:         resb 1048576    ; 1 MB worth of "path\n" lines
+list_stdin_len:         resq 1
+list_font_base:         resq 1          ; mmap base of the current font being processed
+list_font_size:         resq 1
+list_name_off:          resq 1          ; offset of name table within the font
+list_name_len:          resq 1
+list_family_buf:        resb 256
+list_family_len:        resq 1
+list_style_buf:         resb 256
+list_style_len:         resq 1
 %endif
 
 ; ---- parse_simple_into transient state (single-call only — no recursion) ----
@@ -397,6 +409,44 @@ global _start
 _start:
         mov     rbp, rsp                ; for argv access
         mov     rax, [rbp]              ; argc
+        cmp     rax, 2
+        jl      .usage
+
+        ; ---- --list / --preview dispatch ----
+        ; Detect "--" prefix on argv[1] and branch to the new flag handlers.
+        mov     rdi, [rbp + 16]         ; argv[1]
+        cmp     word [rdi], '--'
+        jne     .standard_cli
+        ; "--list" → batch name-table read from stdin.
+        cmp     dword [rdi + 2], 'list'
+        jne     .check_preview_flag
+        cmp     byte [rdi + 6], 0
+        jne     .check_preview_flag
+        call    do_list
+        xor     edi, edi
+        jmp     .exit
+.check_preview_flag:
+        ; "--preview FONT.ttf SIZE TEXT" → string-render mode with explicit
+        ; positional args, matching the natural reading order.
+        cmp     dword [rdi + 2], 'prev'
+        jne     .usage
+        cmp     dword [rdi + 6], 'iew'  ; matches 'i' 'e' 'w' '\0'
+        jne     .usage
+        cmp     rax, 5
+        jl      .usage
+        ; Translate --preview args into the existing string-mode globals.
+        mov     rdi, [rbp + 24]         ; argv[2] = font path
+        mov     [arg_font_path], rdi
+        mov     rdi, [rbp + 32]         ; argv[3] = size
+        call    parse_decimal
+        mov     [arg_size], rax
+        mov     qword [arg_weight], 0
+        mov     qword [str_mode], 1
+        mov     rdi, [rbp + 40]         ; argv[4] = text
+        mov     [arg_string_ptr], rdi
+        jmp     .have_args
+
+.standard_cli:
         cmp     rax, 4
         jl      .usage
         cmp     rax, 5
@@ -433,6 +483,7 @@ _start:
         jmp     .have_args
 .string_mode:
         mov     qword [str_mode], 1
+        mov     [arg_string_ptr], rdi   ; rdi still = argv[2] from the digit check
 .have_args:
 
         ; --- load + parse the font (single API call) ---
@@ -486,7 +537,7 @@ _start:
 
 .render_string:
         ; ===== string mode =====
-        mov     rdi, [rbp + 24]          ; argv[2]
+        mov     rdi, [arg_string_ptr]    ; argv[2] (old CLI) or argv[4] (--preview)
         call    string_prepass           ; fills str_glyph_ids[], str_pen_x_fix[], str_total_W, str_len
         cmp     rax, 1
         je      .err_str_long
@@ -3793,6 +3844,474 @@ dump_outline:
 
         pop     rbx
         ret
+
+; =====================================================================
+; --- --list mode: stdin-driven batch font name extraction ---
+;
+; Reads font paths from stdin (one per line), opens each, finds the SFNT
+; `name` table, extracts NameID 1 (Family) and NameID 2 (Subfamily/Style),
+; prints "path\tfamily\tstyle\n" per font to stdout. Invalid / unreadable
+; fonts are silently skipped — the caller treats this as a best-effort
+; enumeration.
+;
+; Preferred name source: (platform=3, encoding=1, lang=0x0409) Windows
+; Unicode US English. Falls back to (platform=1, encoding=0) Mac Roman.
+; UTF-16BE names are flattened to low-byte-per-codeunit, which is
+; correct for ASCII names and acceptable mojibake for non-ASCII (the
+; picker UI presents the path alongside as a tiebreaker).
+; =====================================================================
+
+%define SYS_LSEEK       8
+
+do_list:
+        push    rbx
+        push    r12
+        push    r13
+        ; Drain stdin into list_stdin_buf.
+        xor     ebx, ebx                ; bytes read so far
+.dl_read:
+        mov     rax, SYS_READ
+        xor     edi, edi                ; stdin
+        lea     rsi, [list_stdin_buf]
+        add     rsi, rbx
+        mov     edx, 1048576
+        sub     edx, ebx
+        jle     .dl_drained
+        syscall
+        test    rax, rax
+        jle     .dl_drained
+        add     rbx, rax
+        jmp     .dl_read
+.dl_drained:
+        mov     [list_stdin_len], rbx
+        ; Walk the buffer, terminating each line in-place and processing.
+        lea     r12, [list_stdin_buf]   ; line start
+        lea     r13, [list_stdin_buf]
+        add     r13, rbx                ; end pointer
+.dl_loop:
+        cmp     r12, r13
+        jge     .dl_done
+        ; scan for newline
+        mov     rdi, r12
+.dl_scan:
+        cmp     rdi, r13
+        jge     .dl_end_line            ; no newline at EOF — still process
+        cmp     byte [rdi], 10
+        je      .dl_have_line
+        inc     rdi
+        jmp     .dl_scan
+.dl_have_line:
+        mov     byte [rdi], 0           ; terminate
+.dl_end_line:
+        ; rdi now points to NUL (or end-of-buffer); r12 = path
+        cmp     r12, rdi
+        je      .dl_advance             ; empty line — skip
+        mov     rdi, r12
+        call    process_font_path
+.dl_advance:
+        ; advance past the NUL (or to end)
+        mov     rdi, r12
+.dl_skip:
+        cmp     rdi, r13
+        jge     .dl_done
+        cmp     byte [rdi], 0
+        je      .dl_after_nul
+        inc     rdi
+        jmp     .dl_skip
+.dl_after_nul:
+        inc     rdi
+        mov     r12, rdi
+        jmp     .dl_loop
+.dl_done:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; process_font_path(rdi = NUL-terminated path)
+;   open, mmap, find name table, extract family + style, emit
+;   "path\tfamily\tstyle\n", munmap, close. Silently skips on any error.
+; ---------------------------------------------------------------------
+process_font_path:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        mov     r14, rdi                ; save path
+
+        mov     rax, SYS_OPEN
+        xor     esi, esi                ; O_RDONLY
+        xor     edx, edx
+        syscall
+        test    rax, rax
+        js      .pf_done
+        mov     r12, rax                ; fd
+
+        mov     rax, SYS_FSTAT
+        mov     rdi, r12
+        lea     rsi, [stat_buf]
+        syscall
+        test    rax, rax
+        js      .pf_close
+        mov     r13, [stat_buf + ST_SIZE_OFF]
+        cmp     r13, 12                 ; need at least SFNT header
+        jl      .pf_close
+
+        mov     rax, SYS_MMAP
+        xor     edi, edi
+        mov     rsi, r13
+        mov     edx, PROT_READ
+        mov     r10d, MAP_PRIVATE
+        mov     r8, r12
+        xor     r9d, r9d
+        syscall
+        cmp     rax, -4096
+        ja      .pf_close
+        mov     rbx, rax                ; mmap base
+        mov     [list_font_base], rax
+        mov     [list_font_size], r13
+
+        mov     rax, SYS_CLOSE
+        mov     rdi, r12
+        syscall
+
+        ; Find the name table.
+        mov     rdi, rbx
+        mov     rsi, r13
+        call    find_name_table_lite
+        test    rax, rax
+        jz      .pf_munmap
+        mov     [list_name_off], rax
+        mov     [list_name_len], rdx
+
+        ; Extract family (NameID 1) → list_family_buf.
+        mov     rdi, rbx
+        add     rdi, [list_name_off]
+        mov     esi, 1
+        lea     rdx, [list_family_buf]
+        call    extract_name
+        mov     [list_family_len], rax
+        test    rax, rax
+        jz      .pf_munmap              ; need at least the family
+
+        ; Extract style (NameID 2) → list_style_buf.
+        mov     rdi, rbx
+        add     rdi, [list_name_off]
+        mov     esi, 2
+        lea     rdx, [list_style_buf]
+        call    extract_name
+        mov     [list_style_len], rax
+
+        ; Emit "path\tfamily\tstyle\n" to stdout.
+        ; path
+        mov     rdi, r14
+        call    write_cstring_stdout
+        call    write_tab_stdout
+        ; family
+        lea     rsi, [list_family_buf]
+        mov     rdx, [list_family_len]
+        call    write_buf_stdout
+        call    write_tab_stdout
+        ; style (may be empty)
+        lea     rsi, [list_style_buf]
+        mov     rdx, [list_style_len]
+        call    write_buf_stdout
+        ; newline
+        call    write_nl_stdout
+
+.pf_munmap:
+        mov     rax, SYS_MUNMAP
+        mov     rdi, [list_font_base]
+        mov     rsi, [list_font_size]
+        syscall
+        jmp     .pf_done
+.pf_close:
+        mov     rax, SYS_CLOSE
+        mov     rdi, r12
+        syscall
+.pf_done:
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; find_name_table_lite(rdi = font base, rsi = font size)
+;   Scans the SFNT table directory for the "name" tag. Returns:
+;     rax = offset of name table from font base (0 if not found)
+;     rdx = length of name table (0 if not found)
+; ---------------------------------------------------------------------
+find_name_table_lite:
+        push    rbx
+        push    r12
+        push    r13
+        mov     rbx, rdi                ; font base
+        mov     r12, rsi                ; font size
+        ; Validate SFNT scaler: 0x00010000, 'OTTO', 'true', 'typ1'.
+        mov     eax, [rbx]
+        cmp     eax, 0x00000100         ; TrueType: bytes 00 01 00 00 → LE u32 0x00000100
+        je      .fn_ok
+        cmp     eax, 'OTTO'             ; OpenType (palindrome — same in either order)
+        je      .fn_ok
+        cmp     eax, 'true'             ; "true" tag (Mac TrueType)
+        je      .fn_ok
+        cmp     eax, 'typ1'             ; "typ1" tag (PostScript Type 1)
+        je      .fn_ok
+        xor     eax, eax
+        xor     edx, edx
+        jmp     .fn_done
+.fn_ok:
+        ; numTables at offset 4 as u16 BE.
+        movzx   eax, word [rbx + 4]
+        rol     ax, 8                   ; little→big endian for 16-bit
+        movzx   r13d, ax                ; numTables
+        test    r13d, r13d
+        jz      .fn_miss
+        ; Walk records starting at base + 12. Each record is 16 bytes.
+        lea     rdi, [rbx + 12]
+        xor     ecx, ecx                ; index
+.fn_walk:
+        cmp     ecx, r13d
+        jge     .fn_miss
+        ; tag is 4 bytes at offset 0 of record
+        cmp     dword [rdi], 'name'     ; "name" tag; NASM packs char-literal first→LSB, matching the LE-u32 read
+        jne     .fn_next
+        ; Found. offset at +8 (u32 BE), length at +12 (u32 BE).
+        mov     eax, [rdi + 8]
+        bswap   eax
+        mov     edx, [rdi + 12]
+        bswap   edx
+        ; Sanity-check that the table fits inside the mmap.
+        mov     r8, rax
+        add     r8, rdx
+        cmp     r8, r12
+        ja      .fn_miss
+        jmp     .fn_done
+.fn_next:
+        add     rdi, 16
+        inc     ecx
+        jmp     .fn_walk
+.fn_miss:
+        xor     eax, eax
+        xor     edx, edx
+.fn_done:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; extract_name(rdi = name table base, esi = nameID, rdx = out buf)
+;   Walks NameRecords, picks the best-matching record (prefer Windows
+;   Unicode US English, fall back to Mac Roman), copies the string to
+;   the output buffer. Returns the byte length written in rax.
+; ---------------------------------------------------------------------
+extract_name:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        mov     rbx, rdi                ; name table base
+        mov     r12d, esi               ; target nameID
+        mov     r13, rdx                ; out buf
+
+        ; count at offset 2 (u16 BE), stringOffset at offset 4 (u16 BE).
+        movzx   eax, word [rbx + 2]
+        rol     ax, 8
+        movzx   r14d, ax                ; count
+        movzx   eax, word [rbx + 4]
+        rol     ax, 8
+        movzx   r15d, ax                ; stringOffset
+
+        ; Two-pass: first look for (3,1,0x409); if not found, take any (1,0,*).
+        ; Track best record offset in r9, source flag in r10 (0=Windows, 1=Mac, -1=none).
+        mov     r9d, -1                 ; best record index (-1 = none)
+        mov     r10d, 0                 ; encoding flag
+        xor     ecx, ecx                ; index
+.en_walk:
+        cmp     ecx, r14d
+        jge     .en_done_walk
+        ; record base = rbx + 6 + ecx * 12
+        mov     edi, ecx
+        imul    edi, 12
+        add     edi, 6
+        lea     r8, [rbx + rdi]         ; record ptr
+        ; nameID at +6
+        movzx   eax, word [r8 + 6]
+        rol     ax, 8
+        cmp     eax, r12d
+        jne     .en_skip
+        ; matched nameID — examine platform/encoding/language
+        movzx   eax, word [r8]
+        rol     ax, 8                   ; platformID
+        movzx   edx, word [r8 + 2]
+        rol     dx, 8                   ; encodingID
+        movzx   edi, word [r8 + 4]
+        rol     di, 8                   ; languageID
+        cmp     eax, 3
+        jne     .en_check_mac
+        cmp     edx, 1
+        jne     .en_check_mac
+        ; Windows Unicode — prefer en-US 0x0409, but accept any if we
+        ; haven't found one yet.
+        cmp     edi, 0x0409
+        je      .en_pick_win
+        cmp     r9d, -1
+        je      .en_record_win
+        ; already had something (Mac or non-en-US Windows); en-US wins.
+        cmp     r10d, 0
+        jne     .en_record_win          ; we had Mac, upgrade to Windows
+        jmp     .en_skip
+.en_pick_win:
+        mov     r9d, ecx
+        mov     r10d, 0
+        ; en-US Windows is the gold; finish but keep looping (later
+        ; records can't beat it, so we could break — but be tolerant).
+        jmp     .en_skip
+.en_record_win:
+        mov     r9d, ecx
+        mov     r10d, 0
+        jmp     .en_skip
+.en_check_mac:
+        cmp     eax, 1
+        jne     .en_skip
+        cmp     edx, 0
+        jne     .en_skip
+        cmp     r9d, -1
+        jne     .en_skip                ; only take Mac if nothing else
+        mov     r9d, ecx
+        mov     r10d, 1
+.en_skip:
+        inc     ecx
+        jmp     .en_walk
+.en_done_walk:
+        cmp     r9d, -1
+        je      .en_empty
+
+        ; Read the chosen record's length / string offset.
+        mov     eax, r9d
+        imul    eax, 12
+        add     eax, 6
+        lea     r8, [rbx + rax]         ; record ptr
+        movzx   eax, word [r8 + 8]
+        rol     ax, 8
+        movzx   r11d, ax                ; string byte length
+        movzx   eax, word [r8 + 10]
+        rol     ax, 8                   ; offset from stringOffset
+        movzx   edx, ax
+        ; string source = name table base + stringOffset + recordOffset
+        lea     rsi, [rbx + r15]
+        add     rsi, rdx
+        ; Clamp length to output buffer size (255).
+        cmp     r11d, 255
+        jbe     .en_len_ok
+        mov     r11d, 255
+.en_len_ok:
+        ; Copy. Windows = UTF-16BE, take low byte of each codeunit;
+        ; Mac = single-byte, copy directly.
+        cmp     r10d, 0
+        jne     .en_copy_mac
+        ; Windows: each codeunit is 2 bytes BE; the low byte is +1.
+        ; Output count = byteLen / 2.
+        shr     r11d, 1
+        mov     ecx, r11d
+        xor     edi, edi
+.en_copy_win:
+        test    ecx, ecx
+        jz      .en_copy_done
+        movzx   eax, byte [rsi + 1]     ; low byte of BE u16
+        ; Skip non-printable codeunits (control chars, NUL).
+        cmp     eax, 0x20
+        jb      .en_win_advance
+        cmp     eax, 0x7E
+        ja      .en_win_advance
+        mov     [r13 + rdi], al
+        inc     edi
+.en_win_advance:
+        add     rsi, 2
+        dec     ecx
+        jmp     .en_copy_win
+.en_copy_mac:
+        mov     ecx, r11d
+        xor     edi, edi
+.en_copy_mac_loop:
+        test    ecx, ecx
+        jz      .en_copy_done
+        movzx   eax, byte [rsi]
+        cmp     eax, 0x20
+        jb      .en_mac_advance
+        cmp     eax, 0x7E
+        ja      .en_mac_advance
+        mov     [r13 + rdi], al
+        inc     edi
+.en_mac_advance:
+        inc     rsi
+        dec     ecx
+        jmp     .en_copy_mac_loop
+.en_copy_done:
+        mov     rax, rdi                ; final length
+        jmp     .en_ret
+.en_empty:
+        xor     eax, eax
+.en_ret:
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------------
+; tiny stdout helpers used by do_list / process_font_path
+; ---------------------------------------------------------------------
+write_cstring_stdout:
+        push    rbx
+        mov     rbx, rdi
+        xor     ecx, ecx
+.wc_len:
+        cmp     byte [rbx + rcx], 0
+        je      .wc_emit
+        inc     rcx
+        jmp     .wc_len
+.wc_emit:
+        mov     rsi, rbx
+        mov     edx, ecx
+        mov     edi, STDOUT
+        mov     eax, SYS_WRITE
+        syscall
+        pop     rbx
+        ret
+
+write_buf_stdout:
+        ; rsi = buf, rdx = len
+        test    rdx, rdx
+        jz      .wb_done
+        mov     edi, STDOUT
+        mov     eax, SYS_WRITE
+        syscall
+.wb_done:
+        ret
+
+write_tab_stdout:
+        lea     rsi, [.wt_tab]
+        mov     edx, 1
+        mov     edi, STDOUT
+        mov     eax, SYS_WRITE
+        syscall
+        ret
+.wt_tab: db 9
+
+write_nl_stdout:
+        lea     rsi, [.wn_nl]
+        mov     edx, 1
+        mov     edi, STDOUT
+        mov     eax, SYS_WRITE
+        syscall
+        ret
+.wn_nl: db 10
 
 %endif  ; !GLYPH_LIB
 
