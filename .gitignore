@@ -2,3 +2,4 @@
 glyph
 test_lib
 test_lib.o
+glyph_cli
