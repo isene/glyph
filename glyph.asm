@@ -1219,10 +1219,6 @@ glyph_render_to_alpha:
         ; Empty glyph (space etc.): zero-size bitmap, advance = hmtx
         mov     qword [img_W], 0
         mov     qword [img_H], 0
-        xor ecx, ecx
-        xor edx, edx
-        xor r8d, r8d
-        xor r9d, r9d
         mov     rdi, [glyph_id]
         call    hmtx_advance
         imul    rax, [arg_size]
@@ -1233,6 +1229,14 @@ glyph_render_to_alpha:
         cqo
         idiv    rbx
         mov     r10, rax
+        ; Zero W, H and the bearings LAST. hmtx_advance leaves the font's
+        ; metric count in rcx and the division leaves its remainder in rdx.
+        ; Zeroed first, an empty glyph came back as 9822 x 1024 pixels from
+        ; Symbola, and glass read 10 MB past its bitmap and died.
+        xor ecx, ecx
+        xor edx, edx
+        xor r8d, r8d
+        xor r9d, r9d
         xor     eax, eax
         pop     r15
         pop     r14
